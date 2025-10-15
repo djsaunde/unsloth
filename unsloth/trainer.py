@@ -68,9 +68,16 @@ except:
 pass
 
 class UnslothTrainingArguments(TrainingArguments):
-    def __init__(self, embedding_learning_rate: float = None, *args, **kwargs):
-        embedding_learning_rate = embedding_learning_rate
+    def __init__(
+        self,
+        embedding_learning_rate: float = None,
+        use_packed_batches: bool = False,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+        self.embedding_learning_rate = embedding_learning_rate
+        self.use_packed_batches = use_packed_batches
 pass
 
 

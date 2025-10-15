@@ -34,12 +34,10 @@ import os
 
 
 def run(args):
-    import torch
     from unsloth import FastLanguageModel
     from datasets import load_dataset
     from transformers.utils import strtobool
     from trl import SFTTrainer, SFTConfig
-    from transformers import TrainingArguments
     from unsloth import is_bfloat16_supported
     import logging
     logging.getLogger('hf-to-gguf').setLevel(logging.WARNING)
@@ -117,8 +115,23 @@ def run(args):
         report_to=args.report_to,
         max_length=args.max_seq_length,
         dataset_num_proc=2,
-        packing=False,
+        packing=args.sample_packing,
     )
+
+    if args.sample_packing:
+        print(
+            f"Unsloth Packing: Sample packing enabled (max_length={args.max_seq_length})."
+        )
+
+        def _mark_allow_overlength(module):
+            if hasattr(module, "max_seq_length"):
+                setattr(module, "_unsloth_allow_packed_overlength", True)
+                if not hasattr(module, "_unsloth_logged_packed_shape"):
+                    module._unsloth_logged_packed_shape = False
+            for child in module.children():
+                _mark_allow_overlength(child)
+
+        _mark_allow_overlength(model)
 
     # Initialize trainer
     trainer = SFTTrainer(
@@ -199,6 +212,7 @@ if __name__ == "__main__":
     training_group.add_argument('--weight_decay', type=float, default=0.01, help="Weight decay, default is 0.01.")
     training_group.add_argument('--lr_scheduler_type', type=str, default="linear", help="Learning rate scheduler type, default is 'linear'.")
     training_group.add_argument('--seed', type=int, default=3407, help="Seed for reproducibility, default is 3407.")
+    training_group.add_argument('--sample_packing', action='store_true', help="Enable cross-example packing using TRL's dataset bin packing.")
     
 
     # Report/Logging arguments
