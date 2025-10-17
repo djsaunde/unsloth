@@ -49,6 +49,10 @@ from ..kernels import *
 from ..tokenizer_utils import *
 if HAS_FLASH_ATTENTION:
     from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_varlen_func
+else:
+    flash_attn_func = None
+    flash_attn_varlen_func = None
 from .vision import FastBaseModel
 
 # Final patching code
@@ -540,7 +544,61 @@ def LlamaAttention_fast_forward(
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
         V = V.transpose(1, 2)
-        A = flash_attn_func(Q, K, V, causal = True)
+
+        cu_seqlens_q = kwargs.get("cu_seq_lens_q")
+        cu_seqlens_k = kwargs.get("cu_seq_lens_k")
+        max_seqlen_q = kwargs.get("max_length_q")
+        max_seqlen_k = kwargs.get("max_length_k")
+
+        if cu_seqlens_k is None and cu_seqlens_q is not None:
+            cu_seqlens_k = cu_seqlens_q
+        if max_seqlen_k is None and max_seqlen_q is not None:
+            max_seqlen_k = max_seqlen_q
+
+        use_varlen_flash_attn = (
+            flash_attn_varlen_func is not None
+            and cu_seqlens_q is not None
+            and cu_seqlens_k is not None
+            and max_seqlen_q is not None
+            and max_seqlen_k is not None
+        )
+
+        if use_varlen_flash_attn:
+            if isinstance(cu_seqlens_q, torch.Tensor):
+                cu_seqlens_q = cu_seqlens_q.to(device=Q.device, dtype=torch.int32)
+            if isinstance(cu_seqlens_k, torch.Tensor):
+                cu_seqlens_k = cu_seqlens_k.to(device=Q.device, dtype=torch.int32)
+
+            if n_groups != 1:
+                K_expanded = K.unsqueeze(3).expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
+                V_expanded = V.unsqueeze(3).expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
+                K_expanded = K_expanded.reshape(bsz, kv_seq_len, n_heads, head_dim)
+                V_expanded = V_expanded.reshape(bsz, kv_seq_len, n_heads, head_dim)
+            else:
+                K_expanded = K
+                V_expanded = V
+
+            Q_varlen = Q.reshape(-1, n_heads, head_dim)
+            K_varlen = K_expanded.reshape(-1, n_heads, head_dim)
+            V_varlen = V_expanded.reshape(-1, n_heads, head_dim)
+
+            A = flash_attn_varlen_func(
+                Q_varlen,
+                K_varlen,
+                V_varlen,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                0.0,
+                None,
+                True,
+            )
+            A = A.view(bsz, q_len, n_heads, head_dim)
+        else:
+            if flash_attn_func is None:
+                raise RuntimeError("Unsloth: flash_attn_func is unavailable despite flash attention support being detected.")
+            A = flash_attn_func(Q, K, V, causal = True)
     else:
         # when qlen==vlen and attn_mask is None, we should use causal attention
         Q_len = Q.shape[-2]
@@ -620,6 +678,7 @@ def LlamaDecoderLayer_fast_forward(
             use_cache           = use_cache,
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
+            **kwargs,
         )
         hidden_states += residual
 
@@ -641,6 +700,7 @@ def LlamaDecoderLayer_fast_forward(
             use_cache           = use_cache,
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
+            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -710,10 +770,9 @@ def LlamaModel_fast_forward(
         key in kwargs
         for key in (
             "cu_seq_lens_q",
-            "cu_seq_lens",
-            "cu_seqlens",
+            "cu_seq_lens_k",
             "max_length_q",
-            "max_seqlen",
+            "max_length_k",
         )
     )
     if hasattr(self, "max_seq_length") and not allow_overlength:
@@ -954,7 +1013,15 @@ def LlamaModel_fast_forward(
         if gradient_checkpointing and not isinstance(decoder_layer, GradientCheckpointingLayer):
             def create_custom_forward(module):
                 def custom_forward(*inputs):
-                    return module(*inputs, past_key_value, output_attentions, padding_mask = padding_mask, position_embeddings = position_embeddings)
+                    return module(
+                        *inputs,
+                        past_key_value      = past_key_value,
+                        output_attentions   = output_attentions,
+                        use_cache           = use_cache,
+                        padding_mask        = padding_mask,
+                        position_embeddings = position_embeddings,
+                        **kwargs,
+                    )
                 return custom_forward
             pass
             layer_outputs = torch.utils.checkpoint.checkpoint(
@@ -979,6 +1046,7 @@ def LlamaModel_fast_forward(
                 use_cache           = use_cache,
                 padding_mask        = padding_mask,
                 position_embeddings = position_embeddings,
+                **kwargs,
             )
             hidden_states = layer_outputs[0]
         pass
@@ -1146,6 +1214,7 @@ def CausalLM_fast_forward(fast_forward_inference):
                 past_key_values,
                 position_ids = position_ids,
                 attention_mask = attention_mask,
+                **kwargs,
             )
         else:
             causal_mask = xformers.attn_bias.LowerTriangularMask() if HAS_XFORMERS else None
@@ -1168,6 +1237,7 @@ def CausalLM_fast_forward(fast_forward_inference):
                 output_attentions = output_attentions,
                 output_hidden_states = output_hidden_states,
                 return_dict = return_dict,
+                **kwargs,
             )
         pass
         hidden_states = outputs[0]
