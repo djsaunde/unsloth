@@ -60,7 +60,13 @@ from ..utils.packing import (
     get_packed_info_from_kwargs,
 )
 if HAS_FLASH_ATTENTION:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn import flash_attn_func
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+    except ImportError:
+        flash_attn_varlen_func = None
+else:
+    flash_attn_varlen_func = None
 from .vision import FastBaseModel
 
 # Final patching code
