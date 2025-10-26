@@ -120,6 +120,35 @@ def run(args):
         packing=False,
     )
 
+    class _JaggedCollator:
+        def __init__(self, base_collator, pad_token_id: int):
+            self.base_collator = base_collator
+            self.pad_token_id = pad_token_id
+
+        def __call__(self, features):
+            batch = self.base_collator(features)
+            input_ids = batch.get("input_ids")
+            if isinstance(input_ids, torch.Tensor) and input_ids.dim() == 2 and hasattr(torch, "jagged"):
+                if "attention_mask" in batch:
+                    lengths = batch["attention_mask"].sum(dim=-1).tolist()
+                else:
+                    lengths = (input_ids != self.pad_token_id).sum(dim=-1).tolist()
+
+                batch["input_ids"] = torch.nested.nested_tensor(
+                    [input_ids[i, :length] for i, length in enumerate(lengths)],
+                    layout=torch.jagged,
+                )
+
+                labels = batch.get("labels")
+                if isinstance(labels, torch.Tensor) and labels.dim() == 2:
+                    batch["labels"] = torch.nested.nested_tensor(
+                        [labels[i, :length] for i, length in enumerate(lengths)],
+                        layout=torch.jagged,
+                    )
+
+                batch.pop("attention_mask", None)
+            return batch
+
     # Initialize trainer
     trainer = SFTTrainer(
         model=model,
@@ -127,6 +156,16 @@ def run(args):
         train_dataset=dataset,
         args=training_args,
     )
+
+    if args.use_jagged:
+        if not hasattr(torch, "jagged"):
+            raise RuntimeError("Torch build does not expose torch.jagged; upgrade to PyTorch 2.6 or newer.")
+
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("Tokenizer needs a pad or EOS token to determine ragged lengths for jagged training.")
+
+        trainer.data_collator = _JaggedCollator(trainer.data_collator, pad_token_id)
 
     # Train model
     trainer_stats = trainer.train()
@@ -199,6 +238,7 @@ if __name__ == "__main__":
     training_group.add_argument('--weight_decay', type=float, default=0.01, help="Weight decay, default is 0.01.")
     training_group.add_argument('--lr_scheduler_type', type=str, default="linear", help="Learning rate scheduler type, default is 'linear'.")
     training_group.add_argument('--seed', type=int, default=3407, help="Seed for reproducibility, default is 3407.")
+    training_group.add_argument('--use_jagged', action='store_true', help="Enable jagged tensors during training (requires PyTorch jagged layout support).")
     
 
     # Report/Logging arguments

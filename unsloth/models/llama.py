@@ -116,6 +116,50 @@ torch_nn_functional_softmax = torch.nn.functional.softmax
 SDPA_HAS_GQA = "enable_gqa" in scaled_dot_product_attention.__doc__
 
 
+HAS_JAGGED_LAYOUT = hasattr(torch, "jagged")
+
+
+def _is_jagged_tensor(value: Optional[torch.Tensor]) -> bool:
+    return bool(
+        HAS_JAGGED_LAYOUT
+        and isinstance(value, torch.Tensor)
+        and value.is_nested
+        and value.layout == torch.jagged
+    )
+
+
+def _nested_sequence_lengths(nested: torch.Tensor) -> List[int]:
+    return [int(chunk.size(0)) for chunk in nested.unbind()] if nested.is_nested else []
+
+
+def _nested_pointwise_add(*tensors: torch.Tensor) -> torch.Tensor:
+    if not tensors:
+        raise ValueError("_nested_pointwise_add expects at least one tensor")
+    if len(tensors) == 1:
+        return tensors[0]
+
+    per_tensor_chunks = [tensor.unbind() for tensor in tensors]
+    aggregated: List[torch.Tensor] = []
+    for parts in zip(*per_tensor_chunks):
+        accumulator = parts[0]
+        for contribution in parts[1:]:
+            accumulator = accumulator + contribution
+        aggregated.append(accumulator)
+
+    return torch.nested.nested_tensor(aggregated, layout=torch.jagged)
+
+
+def _apply_rope_to_jagged(q_or_k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, seq_lengths: List[int]) -> torch.Tensor:
+    half_dim = q_or_k.size(-1) // 2
+    outputs: List[torch.Tensor] = []
+    for chunk, length in zip(q_or_k.unbind(), seq_lengths):
+        cos_slice = cos[:length].unsqueeze(0).to(chunk.dtype)
+        sin_slice = sin[:length].unsqueeze(0).to(chunk.dtype)
+        rotated = torch.cat((-chunk[..., half_dim:], chunk[..., :half_dim]), dim=-1)
+        outputs.append(chunk * cos_slice + rotated * sin_slice)
+    return torch.nested.nested_tensor(outputs, layout=torch.jagged)
+
+
 # Fix new HF's inference code
 def _fast_prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs,):
     past_key_values = kwargs.get("past_key_values", None)
@@ -469,6 +513,61 @@ def LlamaAttention_fast_forward(
         del self.attention
     pass
 
+    if _is_jagged_tensor(hidden_states):
+        if past_key_value is not None or use_cache:
+            raise NotImplementedError("Unsloth jagged tensors do not yet support KV caching")
+        if attention_mask is not None:
+            raise NotImplementedError("Jagged tensors currently expect attention_mask=None")
+
+        bsz = hidden_states.size(0)
+        seq_lengths = _nested_sequence_lengths(hidden_states)
+        n_heads = self.config.num_attention_heads
+        n_kv_heads = self.config.num_key_value_heads
+        n_groups = self.num_key_value_groups
+        head_dim = self.head_dim
+
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+
+        query = query.unflatten(-1, (n_heads, head_dim)).transpose(1, 2)
+        key = key.unflatten(-1, (n_kv_heads, head_dim)).transpose(1, 2)
+        value = value.unflatten(-1, (n_kv_heads, head_dim)).transpose(1, 2)
+
+        max_seq_len = max(seq_lengths) if seq_lengths else 0
+        if max_seq_len:
+            self.rotary_emb.extend_rope_embedding(hidden_states, max_seq_len)
+            device_index = hidden_states.device.index
+            if device_index is None:
+                device_index = 0
+            cos_cache, sin_cache = self.rotary_emb.get_cached(max_seq_len, device_index)
+            cos_cache = cos_cache[:max_seq_len]
+            sin_cache = sin_cache[:max_seq_len]
+            query = _apply_rope_to_jagged(query, cos_cache, sin_cache, seq_lengths)
+            key = _apply_rope_to_jagged(key, cos_cache, sin_cache, seq_lengths)
+
+        if SDPA_HAS_GQA:
+            attn_output = scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=n_groups != 1,
+            )
+        else:
+            attn_output = scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                is_causal=True,
+            )
+
+        attn_output = attn_output.transpose(1, 2).flatten(-2)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None, None
+
     bsz, q_len, _ = hidden_states.size()
 
     n_heads    = self.config.num_attention_heads
@@ -607,6 +706,35 @@ def LlamaDecoderLayer_fast_forward(
             (see `past_key_values`).
         past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
     """
+    if _is_jagged_tensor(hidden_states):
+        if use_cache:
+            raise NotImplementedError("Jagged tensors do not yet support use_cache in decoder layers")
+        if output_attentions:
+            raise NotImplementedError("Jagged tensors cannot return attentions yet")
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        attention_output, _, _ = self.self_attn(
+            hidden_states       = hidden_states,
+            causal_mask         = causal_mask,
+            attention_mask      = attention_mask,
+            position_ids        = position_ids,
+            past_key_value      = None,
+            output_attentions   = False,
+            use_cache           = False,
+            padding_mask        = padding_mask,
+            position_embeddings = position_embeddings,
+        )
+        hidden_states = _nested_pointwise_add(residual, attention_output)
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_output = self.mlp(hidden_states)
+        hidden_states = _nested_pointwise_add(residual, mlp_output)
+
+        outputs = (hidden_states,)
+        return outputs
+
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
         hidden_states = fast_rms_layernorm_inference(self.input_layernorm, hidden_states)
@@ -669,6 +797,112 @@ __DTYPE_MAP = {
 }
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L825
+def _llama_model_fast_forward_jagged(
+    self,
+    input_ids,
+    attention_mask,
+    position_ids,
+    past_key_values,
+    inputs_embeds,
+    use_cache,
+    output_attentions,
+    output_hidden_states,
+    return_dict,
+    causal_mask,
+    *args,
+    **kwargs,
+):
+    if past_key_values is not None or use_cache:
+        raise NotImplementedError("Jagged tensors do not yet support KV cache usage")
+    if output_attentions:
+        raise NotImplementedError("Jagged tensors cannot return attentions yet")
+    if attention_mask is not None:
+        raise NotImplementedError("Jagged tensors currently expect attention_mask=None")
+    if position_ids is not None:
+        raise NotImplementedError("Jagged tensors currently rely on implicit position ids")
+
+    if inputs_embeds is None:
+        if input_ids is None:
+            raise ValueError("input_ids or inputs_embeds must be provided for jagged tensors")
+        inputs_embeds = self.embed_tokens(input_ids.to(torch.long))
+
+    inputs_embeds = inputs_embeds.to(_get_dtype(dtype_from_config(self.config)))
+
+    IS_GEMMA   = self.config.model_type.startswith("gemma")
+    IS_GEMMA2  = self.config.model_type.startswith("gemma2")
+    IS_COHERE  = self.config.model_type.startswith("cohere")
+    IS_GRANITE = self.config.model_type.startswith("granite")
+    IS_FALCON_H1 = self.config.model_type.startswith("falcon_h1")
+
+    train_embed_tokens = self.embed_tokens.weight.requires_grad
+
+    if IS_GEMMA:
+        normalizer = torch.tensor(math_sqrt(self.config.hidden_size), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        if train_embed_tokens:
+            inputs_embeds = inputs_embeds * normalizer
+        else:
+            inputs_requires_grad = inputs_embeds.requires_grad
+            if not inputs_embeds.is_leaf:
+                inputs_embeds = inputs_embeds.detach()
+                inputs_requires_grad = True
+            elif inputs_requires_grad:
+                inputs_embeds.requires_grad_(False)
+            inputs_embeds = inputs_embeds * normalizer
+            if inputs_requires_grad:
+                inputs_embeds.requires_grad_(True)
+
+    hidden_states = inputs_embeds
+    if IS_GRANITE or IS_FALCON_H1:
+        hidden_states = self.config.embedding_multiplier * hidden_states
+
+    if output_hidden_states:
+        all_hidden_states: Optional[Tuple[torch.Tensor, ...]] = tuple()
+    else:
+        all_hidden_states = None
+
+    for decoder_layer in self.layers:
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)  # type: ignore[arg-type]
+
+        layer_outputs = decoder_layer(
+            hidden_states=hidden_states,
+            causal_mask=causal_mask,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            padding_mask=None,
+            position_embeddings=None,
+        )
+
+        hidden_states = layer_outputs[0]
+
+    if output_hidden_states:
+        all_hidden_states = all_hidden_states + (hidden_states,)  # type: ignore[arg-type]
+
+    if IS_FALCON_H1 and hasattr(self, "final_layernorm"):
+        hidden_states = self.final_layernorm(hidden_states)
+    else:
+        hidden_states = self.norm(hidden_states)
+
+    if output_hidden_states:
+        all_hidden_states = all_hidden_states[:-1] + (hidden_states,)  # type: ignore[index]
+
+    if not return_dict:
+        output = (hidden_states,)
+        if output_hidden_states:
+            output += (all_hidden_states,)
+        return output
+
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=None,
+        hidden_states=all_hidden_states,
+        attentions=None,
+    )
+
+
 def LlamaModel_fast_forward(
     self,
     input_ids:            torch.LongTensor,
@@ -692,6 +926,23 @@ def LlamaModel_fast_forward(
     use_cache = use_cache if use_cache is not None else self.config.use_cache
 
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if _is_jagged_tensor(input_ids) or _is_jagged_tensor(inputs_embeds):
+        return _llama_model_fast_forward_jagged(
+            self,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            inputs_embeds,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+            causal_mask,
+            *args,
+            **kwargs,
+        )
 
     # retrieve input_ids and inputs_embeds
     if input_ids is not None and inputs_embeds is not None:
@@ -1161,6 +1412,18 @@ def CausalLM_fast_forward(fast_forward_inference):
             )
         pass
         hidden_states = outputs[0]
+
+        jagged_lengths: Optional[List[int]] = None
+        if _is_jagged_tensor(hidden_states):
+            jagged_lengths = _nested_sequence_lengths(hidden_states)
+            hidden_states = hidden_states.to_padded_tensor(0.0)
+            if labels is not None:
+                if _is_jagged_tensor(labels):
+                    labels = labels.to_padded_tensor(-100)
+                elif isinstance(labels, torch.Tensor) and labels.dim() == 2:
+                    for row, length in enumerate(jagged_lengths):
+                        if length < labels.shape[1]:
+                            labels[row, length:] = -100
 
         bsz, q_len, hd = hidden_states.shape
         lm_head = self.lm_head.weight
