@@ -17,6 +17,11 @@ import os
 from ._utils import __version__
 from unsloth_zoo.utils import Version, _get_dtype
 from unsloth_zoo.hf_utils import dtype_from_config
+from ..utils.packing import (
+    build_sdpa_packed_attention_mask,
+    build_xformers_block_causal_mask,
+    get_packed_info_from_kwargs,
+)
 from .llama import (
     LlamaRotaryEmbedding,
     LlamaLinearScalingRotaryEmbedding,
@@ -94,9 +99,10 @@ def FalconH1Attention_fast_forward(
     assert(n_kv_heads * n_groups == n_heads)
 
     Q, K, V = self.apply_qkv(self, hidden_states)
-    Q = Q.view(bsz, q_len, n_heads,    head_dim)#.transpose(1, 2) # we will transpose after normalisation
-    K = K.view(bsz, q_len, n_kv_heads, head_dim)#.transpose(1, 2) # we will transpose after normalisation
+    Q = Q.view(bsz, q_len, n_heads, head_dim)
+    K = K.view(bsz, q_len, n_kv_heads, head_dim)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+    seq_info = get_packed_info_from_kwargs(kwargs, bsz * q_len, hidden_states.device)
 
     # Falcon H1 multiplies key states by a multiplier
     K = K * self.config.key_multiplier
@@ -130,7 +136,41 @@ def FalconH1Attention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    if (not HAS_FLASH_ATTENTION and attention_mask is None):
+    if HAS_FLASH_ATTENTION and attention_mask is None:
+        Q_t = Q.transpose(1, 2)
+        K_t = K.transpose(1, 2)
+        V_t = V.transpose(1, 2)
+        sw = kv_seq_len
+        window = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
+        if (
+            seq_info is not None
+            and flash_attn_varlen_func is not None
+            and past_key_value is None
+            and window == (-1, -1)
+        ):
+            Q_f = Q_t.reshape(bsz * q_len, n_heads, head_dim)
+            K_f = K_t.reshape(bsz * q_len, n_kv_heads, head_dim)
+            V_f = V_t.reshape(bsz * q_len, n_kv_heads, head_dim)
+            _, cu_seqlens, max_seqlen = seq_info
+            A = flash_attn_varlen_func(
+                Q_f,
+                K_f,
+                V_f,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=True,
+            ).view(bsz, q_len, n_heads, head_dim)
+        else:
+            A = flash_attn_func(Q_t, K_t, V_t, causal=True, window_size=window).view(
+                bsz, q_len, n_heads, head_dim
+            )
+        A = A.reshape(bsz, q_len, n_heads * head_dim)
+
+    elif HAS_XFORMERS and attention_mask is None:
         # Xformers memory efficient attention
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
@@ -151,16 +191,11 @@ def FalconH1Attention_fast_forward(
             Q = Q.view(bsz, q_len, n_kv_heads, n_groups, head_dim)
         pass
 
-        A = xformers_attention(Q, K, V, attn_bias = causal_mask)
-        A = A.view(bsz, q_len, n_heads, head_dim)
+        if seq_info is not None and causal_mask is None:
+            causal_mask = build_xformers_block_causal_mask(seq_info)
 
-    elif HAS_FLASH_ATTENTION and attention_mask is None:
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        sw = kv_seq_len
-        window = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
-        A = flash_attn_func(Q, K, V, causal = True, window_size = window)
+        A = xformers_attention(Q, K, V, attn_bias=causal_mask)
+        A = A.view(bsz, q_len, n_heads, head_dim)
     else:
         # Grouped query attention
         # if n_groups != 1:
@@ -174,7 +209,20 @@ def FalconH1Attention_fast_forward(
         Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
         # Needs (batch_size, n_heads, seq_len, head_dim)
         # is_casual and attention_mask must not be both set!
-        A = scaled_dot_product_attention(Q, K, V, attn_mask = attention_mask, is_causal = False)
+        if seq_info is not None and attention_mask is None:
+            attention_mask = build_sdpa_packed_attention_mask(
+                seq_info, dtype=Q.dtype, device=Q.device
+            )
+            is_causal = False
+        else:
+            is_causal = False
+        A = scaled_dot_product_attention(
+            Q,
+            K,
+            V,
+            attn_mask=attention_mask,
+            is_causal=is_causal,
+        )
         # Go back to (batch_size, seq_len, n_heads, head_dim)
         A = A.transpose(1, 2).contiguous()
     pass
@@ -397,6 +445,7 @@ def FalconH1DecoderLayer_fast_forward(
             use_cache           = use_cache,
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
+            **kwargs,
         )
         attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
@@ -439,6 +488,7 @@ def FalconH1DecoderLayer_fast_forward(
             use_cache           = use_cache,
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
+            **kwargs,
         )
         attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 

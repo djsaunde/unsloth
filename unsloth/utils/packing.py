@@ -1,10 +1,31 @@
-"""Utilities for enabling sample packing across Unsloth entry points."""
+"""Utilities for enabling packed (padding-free) batches across Unsloth."""
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Iterable, Optional, Sequence, Tuple
 
 import torch
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+except Exception as exc:  # pragma: no cover
+    flash_attn_varlen_func = None
+
+try:
+    from xformers.attn_bias import BlockDiagonalCausalMask as _XFormersBlockMask
+except Exception:  # pragma: no cover
+    _XFormersBlockMask = None
+
+
+def configure_sample_packing(config) -> None:
+    """Mutate an ``SFTConfig`` so TRL prepares packed batches."""
+
+    if config is None:
+        raise ValueError("config must not be None")
+
+    setattr(config, "packing", True)
+    setattr(config, "padding_free", True)
+    setattr(config, "remove_unused_columns", False)
 
 
 def enable_sample_packing(
@@ -13,7 +34,7 @@ def enable_sample_packing(
     *,
     sequence_lengths_key: str = "seq_lengths",
 ) -> None:
-    """Enable runtime support for sample packing on an existing trainer."""
+    """Enable runtime support for packed batches on an existing trainer."""
 
     if model is None or trainer is None:
         raise ValueError("model and trainer must not be None")
@@ -42,6 +63,11 @@ def enable_sample_packing(
     if getattr(collator, "_unsloth_packing_wrapped", False):
         return
 
+    if hasattr(collator, "padding_free"):
+        collator.padding_free = True
+    if hasattr(collator, "return_position_ids"):
+        collator.return_position_ids = True
+
     original_torch_call = collator.torch_call
 
     def torch_call_with_lengths(examples: Sequence[dict]):
@@ -54,7 +80,89 @@ def enable_sample_packing(
                     seq_lengths.extend(int(length) for length in lengths)
             if seq_lengths:
                 batch["packed_seq_lengths"] = torch.tensor(seq_lengths, dtype=torch.int32)
+                if "attention_mask" in batch and getattr(collator, "return_position_ids", False):
+                    batch.pop("attention_mask")
         return batch
 
     collator.torch_call = torch_call_with_lengths
     collator._unsloth_packing_wrapped = True
+
+
+def get_packed_info_from_kwargs(
+    kwargs: dict,
+    total_tokens: int,
+    device: torch.device,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, int]]:
+    """Extract packed sequence information from attention kwargs."""
+
+    seq_lengths = kwargs.get("packed_seq_lengths")
+    if seq_lengths is None:
+        return None
+
+    if isinstance(seq_lengths, torch.Tensor):
+        lengths = seq_lengths.to(device=device, dtype=torch.int32)
+    else:
+        lengths = torch.tensor(seq_lengths, device=device, dtype=torch.int32)
+
+    if lengths.ndim > 1:
+        lengths = lengths.reshape(-1)
+
+    if lengths.numel() == 0:
+        return None
+
+    if int(lengths.sum().item()) != total_tokens:
+        return None
+
+    cu_seqlens = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(lengths, dim=0, dtype=torch.int32),
+        ]
+    )
+    max_seqlen = int(lengths.max().item())
+    return lengths, cu_seqlens, max_seqlen
+
+
+def build_xformers_block_causal_mask(
+    seq_info: Tuple[torch.Tensor, torch.Tensor, int]
+):
+    if _XFormersBlockMask is None:
+        return None
+    seq_lengths, _, _ = seq_info
+    lengths = seq_lengths.to("cpu", torch.int32).tolist()
+    if not lengths:
+        return None
+    return _XFormersBlockMask.from_seqlens(lengths)
+
+
+def build_sdpa_packed_attention_mask(
+    seq_info: Tuple[torch.Tensor, torch.Tensor, int],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    seq_lengths, _, _ = seq_info
+    total_tokens = int(seq_lengths.sum().item())
+    mask = torch.full(
+        (total_tokens, total_tokens),
+        float("-inf"),
+        dtype=dtype,
+        device=device,
+    )
+    offset = 0
+    for length in seq_lengths.tolist():
+        length = int(length)
+        if length <= 0:
+            continue
+        block = torch.zeros((length, length), dtype=dtype, device=device)
+        upper = torch.triu(torch.ones((length, length), device=device), diagonal=1).bool()
+        block = block.masked_fill(upper, float("-inf"))
+        mask[offset : offset + length, offset : offset + length] = block
+        offset += length
+    return mask.unsqueeze(0).unsqueeze(0)
+
+
+__all__ = [
+    "configure_sample_packing",
+    "enable_sample_packing",
+]

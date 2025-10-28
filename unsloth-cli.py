@@ -39,7 +39,7 @@ def run(args):
     from transformers.utils import strtobool
     from trl import SFTTrainer, SFTConfig
     from unsloth import is_bfloat16_supported
-    from unsloth.utils import enable_sample_packing
+    from unsloth.utils import configure_sample_packing, enable_sample_packing
     import logging
 
     logging.getLogger("hf-to-gguf").setLevel(logging.WARNING)
@@ -124,10 +124,13 @@ def run(args):
         report_to=args.report_to,
         max_length=args.max_seq_length,
         dataset_num_proc=2,
-        packing=args.sample_packing,
-        padding_free=args.sample_packing,
-        remove_unused_columns=not args.sample_packing,
     )
+
+    if args.sample_packing:
+        print(
+            f"Unsloth Packing: Sample packing enabled (max_length={args.max_seq_length})."
+        )
+        configure_sample_packing(training_args)
 
     trainer = SFTTrainer(
         model=model,
@@ -137,7 +140,7 @@ def run(args):
     )
 
     if args.sample_packing:
-        enable_sample_packing(model=model, trainer=trainer)
+        enable_sample_packing(model, trainer)
 
     trainer.train()
 

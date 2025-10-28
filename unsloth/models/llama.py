@@ -54,8 +54,13 @@ from transformers.modeling_attn_mask_utils import (
 )
 from ..kernels import *
 from ..tokenizer_utils import *
+from ..utils.packing import (
+    build_sdpa_packed_attention_mask,
+    build_xformers_block_causal_mask,
+    get_packed_info_from_kwargs,
+)
 if HAS_FLASH_ATTENTION:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
 from .vision import FastBaseModel
 
 # Final patching code
@@ -485,9 +490,11 @@ def LlamaAttention_fast_forward(
     assert(n_kv_heads * n_groups == n_heads)
 
     Q, K, V = self.apply_qkv(self, hidden_states)
-    Q = Q.view(bsz, q_len, n_heads,    head_dim).transpose(1, 2)
+    Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+
+    seq_info = get_packed_info_from_kwargs(kwargs, bsz * q_len, Q.device)
 
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
@@ -521,9 +528,38 @@ def LlamaAttention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    if (not HAS_FLASH_ATTENTION and HAS_XFORMERS and attention_mask is None):
+    if HAS_FLASH_ATTENTION and attention_mask is None:
+        if (
+            seq_info is not None
+            and flash_attn_varlen_func is not None
+            and past_key_value is None
+        ):
+            Q = Q.transpose(1, 2).reshape(bsz * q_len, n_heads, head_dim)
+            K = K.transpose(1, 2).reshape(bsz * q_len, n_kv_heads, head_dim)
+            V = V.transpose(1, 2).reshape(bsz * q_len, n_kv_heads, head_dim)
+            _, cu_seqlens, max_seqlen = seq_info
+            A = flash_attn_varlen_func(
+                Q,
+                K,
+                V,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                dropout_p=0.0,
+                causal=True,
+            ).view(bsz, q_len, n_heads, head_dim)
+        else:
+            Q = Q.transpose(1, 2)
+            K = K.transpose(1, 2)
+            V = V.transpose(1, 2)
+            A = flash_attn_func(Q, K, V, causal=True)
+
+    elif HAS_XFORMERS and attention_mask is None:
         # Xformers memory efficient attention
         # Also has Flash Attention v2 dispatching
+        if seq_info is not None:
+            causal_mask = build_xformers_block_causal_mask(seq_info)
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
         V = V.transpose(1, 2)
@@ -540,27 +576,32 @@ def LlamaAttention_fast_forward(
             else:
                 Q = Q.view(bsz, q_len, n_kv_heads, n_groups, head_dim)
         pass
-        A = xformers_attention(Q, K, V, attn_bias = causal_mask)
+        A = xformers_attention(Q, K, V, attn_bias=causal_mask)
         A = A.view(bsz, q_len, n_heads, head_dim)
 
-    elif HAS_FLASH_ATTENTION and attention_mask is None:
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        A = flash_attn_func(Q, K, V, causal = True)
     else:
         # when qlen==vlen and attn_mask is None, we should use causal attention
-        Q_len = Q.shape[-2]
-        K_len = K.shape[-2]
-        if attention_mask is None and Q_len == K_len:
-            is_causal = True
-        else:
+        if attention_mask is None and seq_info is not None:
+            attention_mask = build_sdpa_packed_attention_mask(
+                seq_info, dtype=Q.dtype, device=Q.device
+            )
             is_causal = False
+        else:
+            Q_len = Q.shape[-2]
+            K_len = K.shape[-2]
+            is_causal = attention_mask is None and Q_len == K_len
         # Grouped query attention
         if SDPA_HAS_GQA:
             # Needs (batch_size, n_heads, seq_len, head_dim)
             # is_casual and attention_mask must not be both set!
-            A = scaled_dot_product_attention(Q, K, V, attn_mask = attention_mask, is_causal = is_causal, enable_gqa = n_groups != 1)
+            A = scaled_dot_product_attention(
+                Q,
+                K,
+                V,
+                attn_mask=attention_mask,
+                is_causal=is_causal,
+                enable_gqa=n_groups != 1,
+            )
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2)#.contiguous()
         else:
@@ -575,7 +616,13 @@ def LlamaAttention_fast_forward(
             Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
             # Needs (batch_size, n_heads, seq_len, head_dim)
             # is_casual and attention_mask must not be both set!
-            A = scaled_dot_product_attention(Q, K, V, attn_mask = attention_mask, is_causal = is_causal)
+            A = scaled_dot_product_attention(
+                Q,
+                K,
+                V,
+                attn_mask=attention_mask,
+                is_causal=is_causal,
+            )
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2).contiguous()
         pass
@@ -627,6 +674,7 @@ def LlamaDecoderLayer_fast_forward(
             use_cache           = use_cache,
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
+            **kwargs,
         )
         hidden_states += residual
 
@@ -648,6 +696,7 @@ def LlamaDecoderLayer_fast_forward(
             use_cache           = use_cache,
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
+            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -721,6 +770,7 @@ def LlamaModel_fast_forward(
             "cu_seqlens",
             "max_length_q",
             "max_seqlen",
+            "packed_seq_lengths",
         )
     )
     if hasattr(self, "max_seq_length") and not allow_overlength:
@@ -961,7 +1011,14 @@ def LlamaModel_fast_forward(
         if gradient_checkpointing and not isinstance(decoder_layer, GradientCheckpointingLayer):
             def create_custom_forward(module):
                 def custom_forward(*inputs):
-                    return module(*inputs, past_key_value, output_attentions, padding_mask = padding_mask, position_embeddings = position_embeddings)
+                    return module(
+                        *inputs,
+                        past_key_value,
+                        output_attentions,
+                        padding_mask=padding_mask,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
                 return custom_forward
             pass
             layer_outputs = torch.utils.checkpoint.checkpoint(
@@ -986,6 +1043,7 @@ def LlamaModel_fast_forward(
                 use_cache           = use_cache,
                 padding_mask        = padding_mask,
                 position_embeddings = position_embeddings,
+                **kwargs,
             )
             hidden_states = layer_outputs[0]
         pass
@@ -1153,6 +1211,7 @@ def CausalLM_fast_forward(fast_forward_inference):
                 past_key_values,
                 position_ids = position_ids,
                 attention_mask = attention_mask,
+                **kwargs,
             )
         else:
             causal_mask = xformers.attn_bias.LowerTriangularMask() if HAS_XFORMERS else None
@@ -1175,6 +1234,7 @@ def CausalLM_fast_forward(fast_forward_inference):
                 output_attentions = output_attentions,
                 output_hidden_states = output_hidden_states,
                 return_dict = return_dict,
+                **kwargs,
             )
         pass
         hidden_states = outputs[0]
