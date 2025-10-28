@@ -52,6 +52,11 @@ def run(args):
         load_in_4bit=args.load_in_4bit,
     )
 
+    # Disable KV caching during training; jagged tensors and standard SFT runs
+    # do not benefit from it and some model paths error out when it's enabled.
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
     # Configure PEFT model
     model = FastLanguageModel.get_peft_model(
         model,
