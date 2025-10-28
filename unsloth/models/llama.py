@@ -712,8 +712,18 @@ def LlamaModel_fast_forward(
 
     seq_length_with_past = seq_length
 
-    # Fix out of bounds tokenization
-    if hasattr(self, "max_seq_length"):
+    # Fix out of bounds tokenization unless we were given packed metadata
+    allow_overlength = getattr(self, "_unsloth_allow_packed_overlength", False) or any(
+        key in kwargs
+        for key in (
+            "cu_seq_lens_q",
+            "cu_seq_lens",
+            "cu_seqlens",
+            "max_length_q",
+            "max_seqlen",
+        )
+    )
+    if hasattr(self, "max_seq_length") and not allow_overlength:
         if seq_length > self.max_seq_length:
             shape = input_ids.shape if input_ids is not None else inputs_embeds.shape
             logger.warning_once(
