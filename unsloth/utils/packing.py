@@ -19,10 +19,6 @@ except Exception:  # pragma: no cover
 
 def configure_sample_packing(config) -> None:
     """Mutate an ``SFTConfig`` so TRL prepares packed batches."""
-
-    if config is None:
-        raise ValueError("config must not be None")
-
     setattr(config, "packing", True)
     setattr(config, "padding_free", True)
     setattr(config, "remove_unused_columns", False)
@@ -46,13 +42,6 @@ def enable_sample_packing(
             _mark_allow_overlength(child)
 
     _mark_allow_overlength(model)
-
-    config = getattr(model, "config", None)
-    if config is not None:
-        config._attn_implementation = "flash_attention_2"
-    generation_config = getattr(model, "generation_config", None)
-    if generation_config is not None:
-        generation_config.attn_implementation = "flash_attention_2"
 
     if hasattr(trainer, "args") and hasattr(trainer.args, "remove_unused_columns"):
         trainer.args.remove_unused_columns = False
