@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Iterable, Optional, Sequence, Tuple
 
 import torch
@@ -17,8 +18,31 @@ except Exception:  # pragma: no cover
     _XFormersBlockMask = None
 
 
+class _TrlPackingWarningFilter(logging.Filter):
+    _NEEDLES = (
+        "Padding-free training is enabled, but the attention implementation is not set to 'flash_attention_2'",
+        "You are using packing, but the attention implementation is not set to 'flash_attention_2' or 'kernels-community/vllm-flash-attn3'",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - trivial
+        message = record.getMessage()
+        return not any(needle in message for needle in self._NEEDLES)
+
+
+_TRL_FILTER_INSTALLED = False
+
+
+def _ensure_trl_warning_filter() -> None:
+    global _TRL_FILTER_INSTALLED
+    if _TRL_FILTER_INSTALLED:
+        return
+    logging.getLogger("trl.trainer.sft_trainer").addFilter(_TrlPackingWarningFilter())
+    _TRL_FILTER_INSTALLED = True
+
+
 def configure_sample_packing(config) -> None:
     """Mutate an ``SFTConfig`` so TRL prepares packed batches."""
+    _ensure_trl_warning_filter()
     setattr(config, "packing", True)
     setattr(config, "padding_free", True)
     setattr(config, "remove_unused_columns", False)
@@ -31,7 +55,6 @@ def enable_sample_packing(
     sequence_lengths_key: str = "seq_lengths",
 ) -> None:
     """Enable runtime support for packed batches on an existing trainer."""
-
     if model is None or trainer is None:
         raise ValueError("model and trainer must not be None")
 
@@ -149,7 +172,6 @@ def build_sdpa_packed_attention_mask(
         mask[offset : offset + length, offset : offset + length] = block
         offset += length
     return mask.unsqueeze(0).unsqueeze(0)
-
 
 __all__ = [
     "configure_sample_packing",
