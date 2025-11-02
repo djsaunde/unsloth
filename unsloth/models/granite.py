@@ -137,32 +137,33 @@ def GraniteAttention_fast_forward(
     backend = SDPA if attention_mask is not None else select_attention_backend(use_varlen)
 
     window = (kv_seq_len, kv_seq_len)
+    softmax_scale = getattr(self, "scaling", None)
     attention_config = AttentionConfig(
         backend=backend,
         n_kv_heads=n_kv_heads,
         n_groups=n_groups,
         flash_dense_kwargs={
             "causal": True,
-            "softmax_scale": getattr(self, "scaling", None),
+            "softmax_scale": softmax_scale,
             "dropout_p": dropout_p,
             "window_size": window,
         },
         flash_varlen_kwargs={
             "dropout_p": 0.0,
-            "softmax_scale": getattr(self, "scaling", None),
+            "softmax_scale": softmax_scale,
             "causal": True,
         },
         sdpa_kwargs={
             k: v
             for k, v in {
                 "attn_mask": attention_mask,
-                "scale": getattr(self, "scaling", None),
+                "scale": softmax_scale,
                 "dropout_p": dropout_p,
             }.items()
             if v is not None
         },
         xformers_kwargs={
-            "scale": getattr(self, "scaling", None),
+            "scale": softmax_scale,
             "p": dropout_p,
         },
     )
