@@ -8,9 +8,14 @@ from typing import Iterable, Optional, Sequence, Tuple
 import torch
 
 try:
-    from xformers.attn_bias import BlockDiagonalCausalMask as _XFormersBlockMask
-except Exception:  # pragma: no cover
-    _XFormersBlockMask = None
+    from xformers.ops.fmha.attn_bias import (
+        BlockDiagonalCausalMask as _XFormersBlockMask,
+    )
+except Exception:
+    try:
+        from xformers.attn_bias import BlockDiagonalCausalMask as _XFormersBlockMask
+    except Exception:
+        _XFormersBlockMask = None
 
 
 class _TrlPackingWarningFilter(logging.Filter):
