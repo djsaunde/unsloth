@@ -280,21 +280,37 @@ def _patch_sft_trainer(trl_module) -> None:
         )
 
     @functools.wraps(original_compute_loss)
-    def patched_compute_loss(self, model, inputs, return_outputs = False):
+    def patched_compute_loss(self, model, inputs, return_outputs = False, **kwargs):
         manager = getattr(self, "_context_parallel_manager", None)
         context = manager.apply(inputs) if manager else contextlib.nullcontext()
         with context:
-            return original_compute_loss(self, model, inputs, return_outputs)
+            return original_compute_loss(
+                self,
+                model,
+                inputs,
+                return_outputs = return_outputs,
+                **kwargs,
+            )
 
     @functools.wraps(original_prediction_step)
     def patched_prediction_step(
-        self, model, inputs, prediction_loss_only, ignore_keys = None
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys = None,
+        **kwargs,
     ):
         manager = getattr(self, "_context_parallel_manager", None)
         context = manager.apply(inputs) if manager else contextlib.nullcontext()
         with context:
             return original_prediction_step(
-                self, model, inputs, prediction_loss_only, ignore_keys
+                self,
+                model,
+                inputs,
+                prediction_loss_only,
+                ignore_keys,
+                **kwargs,
             )
 
     def enable_context_parallel(self, **kwargs):
