@@ -297,12 +297,13 @@ class ContextParallelManager:
             weight = self._loss_weight(inputs, tensor)
             if weight is None:
                 dist.all_reduce(tensor, op = dist.ReduceOp.SUM, group = self._cp_group)
-                return tensor / self.settings.size
+                return tensor
             scaled = tensor * weight
             dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
             dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
             eps = torch.finfo(weight.dtype).eps
-            return scaled / torch.clamp(weight, min = eps)
+            weight = torch.clamp(weight, min = eps)
+            return scaled / weight * self.settings.size
 
         if isinstance(loss, tuple):
             if not loss:
