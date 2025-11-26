@@ -126,6 +126,15 @@ def run(args):
         distributed = False
 
     # Configure training arguments
+    pad_multiple = args.pad_to_multiple_of
+    if pad_multiple is None and args.context_parallel_size > 1:
+        pad_multiple = 2 * args.context_parallel_size
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"Context parallelism enabled with size {args.context_parallel_size}; "
+                f"auto-setting pad_to_multiple_of={pad_multiple}."
+            )
+
     training_args = SFTConfig(
         per_device_train_batch_size = args.per_device_train_batch_size,
         gradient_accumulation_steps = args.gradient_accumulation_steps,
@@ -149,6 +158,7 @@ def run(args):
         context_parallel_seq_dim = args.context_parallel_seq_dim,
         context_parallel_buffer_names = args.context_parallel_buffer_names,
         context_parallel_no_restore = args.context_parallel_no_restore,
+        pad_to_multiple_of = pad_multiple,
     )
 
     # Initialize trainer
@@ -329,6 +339,15 @@ if __name__ == "__main__":
         type = int,
         default = 3407,
         help = "Seed for reproducibility, default is 3407.",
+    )
+    training_group.add_argument(
+        "--pad_to_multiple_of",
+        type = int,
+        default = None,
+        help = (
+            "Pad every batch to a multiple of this value. "
+            "Defaults to `2 * context_parallel_size` when context parallelism is enabled."
+        ),
     )
 
     context_group = parser.add_argument_group("🧩 Context Parallelism")
