@@ -116,6 +116,7 @@ class ContextParallelManager:
         self._cp_rank_index: int = 0
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._cached_num_items: Optional[torch.Tensor | float | int] = None
+        self._report_loss: Optional[torch.Tensor] = None
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
@@ -287,6 +288,14 @@ class ContextParallelManager:
         self._cached_num_items = None
         return value
 
+    def _set_report_loss(self, value: torch.Tensor) -> None:
+        self._report_loss = value.detach() if torch.is_tensor(value) else None
+
+    def consume_report_loss(self) -> Optional[torch.Tensor]:
+        value = self._report_loss
+        self._report_loss = None
+        return value
+
     def reduce_loss(self, loss, inputs):
         if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
             return loss
@@ -297,13 +306,15 @@ class ContextParallelManager:
             weight = self._loss_weight(inputs, tensor)
             if weight is None:
                 dist.all_reduce(tensor, op = dist.ReduceOp.SUM, group = self._cp_group)
-                return tensor
-            scaled = tensor * weight
-            dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
-            dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
-            eps = torch.finfo(weight.dtype).eps
-            weight = torch.clamp(weight, min = eps)
-            return scaled / weight * self.settings.size
+                avg = tensor / float(self.settings.size)
+            else:
+                scaled = tensor * weight
+                dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
+                dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
+                eps = torch.finfo(weight.dtype).eps
+                avg = scaled / torch.clamp(weight, min = eps)
+            self._set_report_loss(avg)
+            return avg * self.settings.size
 
         if isinstance(loss, tuple):
             if not loss:
@@ -396,6 +407,7 @@ def _patch_sft_trainer(trl_module) -> None:
     original_compute_loss = trainer_cls.compute_loss
     original_prediction_step = trainer_cls.prediction_step
     original_get_train_sampler = getattr(trainer_cls, "_get_train_sampler", None)
+    original_training_step = trainer_cls.training_step
 
     @functools.wraps(original_init)
     def patched_init(self, *args, **kwargs):
@@ -462,6 +474,15 @@ def _patch_sft_trainer(trl_module) -> None:
                 **kwargs,
             )
 
+    @functools.wraps(original_training_step)
+    def patched_training_step(self, *args, **kwargs):
+        loss = original_training_step(self, *args, **kwargs)
+        manager = getattr(self, "_context_parallel_manager", None)
+        report_loss = manager.consume_report_loss() if manager else None
+        if report_loss is not None:
+            return report_loss
+        return loss
+
     def enable_context_parallel(self, **kwargs):
         settings = ContextParallelSettings(**kwargs)
         self._context_parallel_manager = ContextParallelManager(settings)
@@ -469,5 +490,6 @@ def _patch_sft_trainer(trl_module) -> None:
     trainer_cls.__init__ = patched_init
     trainer_cls.compute_loss = patched_compute_loss
     trainer_cls.prediction_step = patched_prediction_step
+    trainer_cls.training_step = patched_training_step
     trainer_cls.enable_context_parallel = enable_context_parallel
     trainer_cls.__unsloth_context_parallel__ = True
