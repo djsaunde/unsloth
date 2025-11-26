@@ -9,6 +9,7 @@ import sys
 
 import torch
 from packaging.version import Version
+import torch.distributed as dist
 
 try:
     from torch.distributed.tensor.experimental import context_parallel
@@ -111,6 +112,7 @@ class ContextParallelManager:
         )
         self._mesh: Optional[DeviceMesh] = None
         self._accelerate_mesh: Optional[DeviceMesh] = None
+        self._cp_group: Optional[dist.ProcessGroup] = None
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._verify_environment()
         if self.enabled:
@@ -156,7 +158,9 @@ class ContextParallelManager:
         group_index = rank // self.settings.size
         start = group_index * self.settings.size
         cp_ranks = torch.arange(start, start + self.settings.size, dtype = torch.int64)
-        return DeviceMesh(DEVICE_TYPE_TORCH, cp_ranks)
+        mesh = DeviceMesh(DEVICE_TYPE_TORCH, cp_ranks)
+        self._cp_group = mesh.get_group()
+        return mesh
 
     def _build_accelerate_mesh(self) -> Optional[DeviceMesh]:
         if not self.enabled:
@@ -216,6 +220,25 @@ class ContextParallelManager:
             no_restore_buffers = no_restore,
         ):
             yield
+
+    def reduce_loss(self, loss):
+        if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
+            return loss
+
+        def _reduce_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor is None or not torch.is_tensor(tensor):
+                return tensor
+            dist.all_reduce(tensor, op = dist.ReduceOp.SUM, group = self._cp_group)
+            return tensor / self.settings.size
+
+        if isinstance(loss, tuple):
+            if not loss:
+                return loss
+            reduced = _reduce_tensor(loss[0])
+            return (reduced, *loss[1:])
+        elif torch.is_tensor(loss):
+            return _reduce_tensor(loss)
+        return loss
 
 
 def patch_trl_for_context_parallel() -> None:
@@ -329,13 +352,16 @@ def _patch_sft_trainer(trl_module) -> None:
         manager = getattr(self, "_context_parallel_manager", None)
         context = manager.apply(inputs) if manager else contextlib.nullcontext()
         with context:
-            return original_compute_loss(
+            loss = original_compute_loss(
                 self,
                 model,
                 inputs,
                 return_outputs = return_outputs,
                 **kwargs,
             )
+        if manager:
+            loss = manager.reduce_loss(loss)
+        return loss
 
     @functools.wraps(original_prediction_step)
     def patched_prediction_step(
