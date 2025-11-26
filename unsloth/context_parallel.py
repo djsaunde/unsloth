@@ -335,8 +335,8 @@ def _patch_sft_trainer(trl_module) -> None:
 
 
 def _build_get_train_sampler(original_get_train_sampler):
-    def patched_get_train_sampler(self, dataset = None):
-        sampler = original_get_train_sampler(self, dataset = dataset)
+    def patched_get_train_sampler(self, train_dataset = None):
+        sampler = original_get_train_sampler(self, train_dataset = train_dataset)
         manager = getattr(self, "_context_parallel_manager", None)
         if manager is None or not manager.enabled:
             return sampler
