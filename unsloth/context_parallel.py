@@ -118,6 +118,7 @@ class ContextParallelManager:
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._cached_num_items: Optional[torch.Tensor | float | int] = None
         self._report_loss: Optional[torch.Tensor] = None
+        self._report_tokens: Optional[torch.Tensor] = None
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
@@ -305,33 +306,55 @@ class ContextParallelManager:
         self._report_loss = None
         return value
 
+    def _set_report_tokens(self, value: torch.Tensor) -> None:
+        self._report_tokens = value.detach() if torch.is_tensor(value) else None
+
+    def consume_report_tokens(self) -> Optional[torch.Tensor]:
+        value = self._report_tokens
+        self._report_tokens = None
+        return value
+
     def reduce_loss(self, loss, inputs):
         if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
             return loss
 
-        def _reduce_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        def _reduce_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             if tensor is None or not torch.is_tensor(tensor):
-                return tensor
+                zeros = torch.zeros(
+                    (),
+                    dtype = tensor.dtype if torch.is_tensor(tensor) else torch.float32,
+                    device = tensor.device if torch.is_tensor(tensor) else None,
+                )
+                return tensor, zeros
             weight = self._loss_weight(inputs, tensor)
             if weight is None:
-                dist.all_reduce(tensor, op = dist.ReduceOp.SUM, group = self._cp_group)
-                avg = tensor / float(self.settings.size)
-            else:
-                scaled = tensor * weight
-                dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
-                dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
-                eps = torch.finfo(weight.dtype).eps
-                avg = scaled / torch.clamp(weight, min = eps)
-            self._set_report_loss(avg)
-            return avg * self.settings.size
+                summed = tensor.clone()
+                dist.all_reduce(summed, op = dist.ReduceOp.SUM, group = self._cp_group)
+                total_tokens = torch.tensor(
+                    float(self.settings.size),
+                    dtype = summed.dtype,
+                    device = summed.device,
+                )
+                return summed, total_tokens
+            scaled = tensor * weight
+            dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
+            dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
+            return scaled, weight
 
         if isinstance(loss, tuple):
             if not loss:
                 return loss
-            reduced = _reduce_tensor(loss[0])
-            return (reduced, *loss[1:])
+            summed, tokens = _reduce_tensor(loss[0])
+            eps = torch.finfo(tokens.dtype).eps
+            self._set_report_loss(summed / torch.clamp(tokens, min = eps))
+            self._set_report_tokens(tokens)
+            return (summed, *loss[1:])
         elif torch.is_tensor(loss):
-            return _reduce_tensor(loss)
+            summed, tokens = _reduce_tensor(loss)
+            eps = torch.finfo(tokens.dtype).eps
+            self._set_report_loss(summed / torch.clamp(tokens, min = eps))
+            self._set_report_tokens(tokens)
+            return summed
         return loss
 
 
@@ -502,6 +525,11 @@ def _patch_sft_trainer(trl_module) -> None:
                 if torch.is_tensor(report_loss)
                 else float(report_loss)
             )
+            tokens = manager.consume_report_tokens()
+            if tokens is not None:
+                self._context_parallel_last_tokens = (
+                    tokens.detach().item() if torch.is_tensor(tokens) else float(tokens)
+                )
         if report_loss is not None:
             return report_loss
         return loss
@@ -516,7 +544,12 @@ def _patch_sft_trainer(trl_module) -> None:
             and hasattr(self, "_context_parallel_last_loss")
         ):
             logs = dict(logs)
-            logs["loss"] = self._context_parallel_last_loss
+            tokens = getattr(self, "_context_parallel_last_tokens", None)
+            if tokens is not None and tokens > 0:
+                logs["loss"] = self._context_parallel_last_loss
+                delattr(self, "_context_parallel_last_tokens")
+            else:
+                logs["loss"] = self._context_parallel_last_loss
             delattr(self, "_context_parallel_last_loss")
         return original_log(self, logs, start_time)
 
