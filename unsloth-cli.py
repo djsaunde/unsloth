@@ -33,6 +33,14 @@ import argparse
 import os
 
 
+def _parse_comma_separated(value):
+    if value is None:
+        return tuple()
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    return tuple(x.strip() for x in value.split(",") if x.strip())
+
+
 def run(args):
     import torch
     from unsloth import FastLanguageModel
@@ -109,6 +117,14 @@ def run(args):
     dataset = dataset.map(formatting_prompts_func, batched = True)
     print("Data is formatted and ready!")
 
+    # Detect whether we're running under torch.distributed so we can tweak trainer defaults.
+    try:
+        import torch.distributed as dist
+
+        distributed = dist.is_available() and dist.is_initialized()
+    except Exception:
+        distributed = False
+
     # Configure training arguments
     training_args = SFTConfig(
         per_device_train_batch_size = args.per_device_train_batch_size,
@@ -127,7 +143,12 @@ def run(args):
         report_to = args.report_to,
         max_length = args.max_seq_length,
         dataset_num_proc = 2,
+        ddp_find_unused_parameters = False if distributed else None,
         packing = False,
+        context_parallel_size = args.context_parallel_size,
+        context_parallel_seq_dim = args.context_parallel_seq_dim,
+        context_parallel_buffer_names = args.context_parallel_buffer_names,
+        context_parallel_no_restore = args.context_parallel_no_restore,
     )
 
     # Initialize trainer
@@ -308,6 +329,41 @@ if __name__ == "__main__":
         type = int,
         default = 3407,
         help = "Seed for reproducibility, default is 3407.",
+    )
+
+    context_group = parser.add_argument_group("🧩 Context Parallelism")
+    context_group.add_argument(
+        "--context_parallel_size",
+        type = int,
+        default = 1,
+        help = (
+            "Number of distributed ranks used for context parallelism. "
+            "Set >1 only when launching with torchrun/accelerate and running PyTorch >= 2.4."
+        ),
+    )
+    context_group.add_argument(
+        "--context_parallel_seq_dim",
+        type = int,
+        default = 1,
+        help = "Sequence dimension for tensors that should be sharded across context-parallel ranks.",
+    )
+    context_group.add_argument(
+        "--context_parallel_buffer_names",
+        type = _parse_comma_separated,
+        default = ("input_ids", "attention_mask", "labels"),
+        help = (
+            "Comma-separated batch keys to shard when context parallelism is enabled. "
+            "Example: input_ids,attention_mask,labels"
+        ),
+    )
+    context_group.add_argument(
+        "--context_parallel_no_restore",
+        type = _parse_comma_separated,
+        default = tuple(),
+        help = (
+            "Comma-separated subset of --context_parallel_buffer_names that do not need to be restored "
+            "after leaving the context parallel region."
+        ),
     )
 
     # Report/Logging arguments
