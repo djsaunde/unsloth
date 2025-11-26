@@ -277,8 +277,7 @@ def _patch_sft_trainer(trl_module) -> None:
     original_compute_loss = trainer_cls.compute_loss
     original_prediction_step = trainer_cls.prediction_step
     original_get_train_sampler = getattr(trainer_cls, "get_train_sampler", None)
-    if original_get_train_sampler is None:
-        original_get_train_sampler = getattr(trainer_cls, "_get_train_sampler", None)
+    original_private_sampler = getattr(trainer_cls, "_get_train_sampler", None)
 
     @functools.wraps(original_init)
     def patched_init(self, *args, **kwargs):
@@ -332,6 +331,10 @@ def _patch_sft_trainer(trl_module) -> None:
     if original_get_train_sampler is not None:
         trainer_cls.get_train_sampler = _build_get_train_sampler(
             original_get_train_sampler
+        )
+    if original_private_sampler is not None:
+        trainer_cls._get_train_sampler = _build_get_train_sampler(
+            original_private_sampler
         )
     trainer_cls.__unsloth_context_parallel__ = True
 
