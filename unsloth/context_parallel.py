@@ -5,6 +5,7 @@ import functools
 import warnings
 from dataclasses import dataclass, field
 from typing import Iterator, Optional, Tuple
+import sys
 
 import torch
 from packaging.version import Version
@@ -257,6 +258,9 @@ def _patch_sft_config(trl_module):
     PatchedSFTConfig.__name__ = base_cls.__name__
     PatchedSFTConfig.__qualname__ = base_cls.__qualname__
     PatchedSFTConfig.__module__ = base_cls.__module__
+    module = sys.modules.get(base_cls.__module__)
+    if module is not None:
+        setattr(module, base_cls.__name__, PatchedSFTConfig)
     trl_module.SFTConfig = PatchedSFTConfig
     if hasattr(trl_module, "trainer") and hasattr(trl_module.trainer, "sft_trainer"):
         trl_module.trainer.sft_trainer.SFTConfig = PatchedSFTConfig
