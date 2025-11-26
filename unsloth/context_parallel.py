@@ -221,15 +221,37 @@ class ContextParallelManager:
         ):
             yield
 
-    def reduce_loss(self, loss):
+    def _loss_weight(self, inputs: dict[str, torch.Tensor], reference: torch.Tensor):
+        if not isinstance(reference, torch.Tensor):
+            return None
+        labels = inputs.get("labels")
+        if isinstance(labels, torch.Tensor):
+            weight = labels.ne(-100).sum()
+            if weight.item() > 0:
+                return weight.to(device = reference.device, dtype = reference.dtype)
+        attention_mask = inputs.get("attention_mask")
+        if isinstance(attention_mask, torch.Tensor):
+            weight = attention_mask.sum()
+            if weight.item() > 0:
+                return weight.to(device = reference.device, dtype = reference.dtype)
+        return None
+
+    def reduce_loss(self, loss, inputs):
         if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
             return loss
 
         def _reduce_tensor(tensor: torch.Tensor) -> torch.Tensor:
             if tensor is None or not torch.is_tensor(tensor):
                 return tensor
-            dist.all_reduce(tensor, op = dist.ReduceOp.SUM, group = self._cp_group)
-            return tensor / self.settings.size
+            weight = self._loss_weight(inputs, tensor)
+            if weight is None:
+                dist.all_reduce(tensor, op = dist.ReduceOp.SUM, group = self._cp_group)
+                return tensor / self.settings.size
+            scaled = tensor * weight
+            dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
+            dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
+            eps = torch.finfo(weight.dtype).eps
+            return scaled / torch.clamp(weight, min = eps)
 
         if isinstance(loss, tuple):
             if not loss:
@@ -360,7 +382,7 @@ def _patch_sft_trainer(trl_module) -> None:
                 **kwargs,
             )
         if manager:
-            loss = manager.reduce_loss(loss)
+            loss = manager.reduce_loss(loss, inputs)
         return loss
 
     @functools.wraps(original_prediction_step)
