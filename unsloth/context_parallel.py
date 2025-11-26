@@ -276,8 +276,7 @@ def _patch_sft_trainer(trl_module) -> None:
     original_init = trainer_cls.__init__
     original_compute_loss = trainer_cls.compute_loss
     original_prediction_step = trainer_cls.prediction_step
-    original_get_train_sampler = getattr(trainer_cls, "get_train_sampler", None)
-    original_private_sampler = getattr(trainer_cls, "_get_train_sampler", None)
+    original_get_train_sampler = getattr(trainer_cls, "_get_train_sampler", None)
 
     @functools.wraps(original_init)
     def patched_init(self, *args, **kwargs):
@@ -329,19 +328,15 @@ def _patch_sft_trainer(trl_module) -> None:
     trainer_cls.prediction_step = patched_prediction_step
     trainer_cls.enable_context_parallel = enable_context_parallel
     if original_get_train_sampler is not None:
-        trainer_cls.get_train_sampler = _build_get_train_sampler(
-            original_get_train_sampler
-        )
-    if original_private_sampler is not None:
         trainer_cls._get_train_sampler = _build_get_train_sampler(
-            original_private_sampler
+            original_get_train_sampler
         )
     trainer_cls.__unsloth_context_parallel__ = True
 
 
 def _build_get_train_sampler(original_get_train_sampler):
-    def patched_get_train_sampler(self):
-        sampler = original_get_train_sampler(self)
+    def patched_get_train_sampler(self, dataset = None):
+        sampler = original_get_train_sampler(self, dataset = dataset)
         manager = getattr(self, "_context_parallel_manager", None)
         if manager is None or not manager.enabled:
             return sampler
