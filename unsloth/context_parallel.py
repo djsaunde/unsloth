@@ -309,17 +309,20 @@ def _patch_sft_trainer(trl_module) -> None:
         accelerator = getattr(self, "accelerator", None)
         manager = getattr(self, "_context_parallel_manager", None)
         mesh = getattr(manager, "accelerate_mesh", None) if manager else None
+        existing_mesh = (
+            getattr(accelerator, "torch_device_mesh", None)
+            if accelerator is not None
+            else None
+        )
         if (
             accelerator is not None
             and mesh is not None
             and (
-                not hasattr(accelerator, "torch_device_mesh")
-                or accelerator.torch_device_mesh is None
-                or "cp"
-                not in getattr(accelerator.torch_device_mesh, "mesh_dim_names", ())
+                existing_mesh is None
+                or "cp" not in getattr(existing_mesh, "mesh_dim_names", ())
             )
         ):
-            accelerator.torch_device_mesh = mesh
+            setattr(accelerator.state, "device_mesh", mesh)
 
     @functools.wraps(original_compute_loss)
     def patched_compute_loss(self, model, inputs, return_outputs = False, **kwargs):
