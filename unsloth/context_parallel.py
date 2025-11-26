@@ -118,6 +118,7 @@ class ContextParallelManager:
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._cached_num_items: Optional[torch.Tensor | float | int] = None
         self._report_loss: Optional[torch.Tensor] = None
+        self._report_weight: Optional[torch.Tensor] = None
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
@@ -280,6 +281,9 @@ class ContextParallelManager:
         if local_tokens is None:
             self._cached_num_items = None
             return
+        if self.settings.size > 1 and self._cp_group is not None:
+            dist.all_reduce(local_tokens, op = dist.ReduceOp.SUM, group = self._cp_group)
+            local_tokens = local_tokens / float(self.settings.size)
         value = inputs["num_items_in_batch"]
         if torch.is_tensor(value):
             local_tokens = local_tokens.to(device = value.device, dtype = value.dtype)
@@ -296,10 +300,19 @@ class ContextParallelManager:
 
     def _set_report_loss(self, value: torch.Tensor) -> None:
         self._report_loss = value.detach() if torch.is_tensor(value) else None
+        self._report_weight = None
 
     def consume_report_loss(self) -> Optional[torch.Tensor]:
         value = self._report_loss
         self._report_loss = None
+        return value
+
+    def _set_report_weight(self, value: torch.Tensor) -> None:
+        self._report_weight = value.detach() if torch.is_tensor(value) else None
+
+    def consume_report_weight(self) -> Optional[torch.Tensor]:
+        value = self._report_weight
+        self._report_weight = None
         return value
 
     def reduce_loss(self, loss, inputs):
@@ -313,13 +326,20 @@ class ContextParallelManager:
             if weight is None:
                 dist.all_reduce(tensor, op = dist.ReduceOp.SUM, group = self._cp_group)
                 avg = tensor / float(self.settings.size)
+                total_weight = torch.tensor(
+                    float(self.settings.size),
+                    device = tensor.device,
+                    dtype = tensor.dtype,
+                )
             else:
                 scaled = tensor * weight
                 dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
                 dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
                 eps = torch.finfo(weight.dtype).eps
                 avg = scaled / torch.clamp(weight, min = eps)
+                total_weight = weight
             self._set_report_loss(avg)
+            self._set_report_weight(total_weight)
             return avg * self.settings.size
 
         if isinstance(loss, tuple):
@@ -414,6 +434,7 @@ def _patch_sft_trainer(trl_module) -> None:
     original_prediction_step = trainer_cls.prediction_step
     original_get_train_sampler = getattr(trainer_cls, "_get_train_sampler", None)
     original_training_step = trainer_cls.training_step
+    original_log = trainer_cls.log
 
     @functools.wraps(original_init)
     def patched_init(self, *args, **kwargs):
@@ -484,17 +505,49 @@ def _patch_sft_trainer(trl_module) -> None:
     def patched_training_step(self, *args, **kwargs):
         manager = getattr(self, "_context_parallel_manager", None)
         original_n_gpu = getattr(self.args, "n_gpu", 1)
+        weight_override = None
         if manager:
             setattr(self.args, "_n_gpu", manager.data_parallel_world_size)
+            weight_override = manager.consume_report_weight()
         try:
             loss = original_training_step(self, *args, **kwargs)
         finally:
             if manager:
                 setattr(self.args, "_n_gpu", original_n_gpu)
         report_loss = manager.consume_report_loss() if manager else None
+        if manager:
+            report_weight = manager.consume_report_weight()
+            if report_loss is not None:
+                self._context_parallel_last_loss = (
+                    report_loss.detach().item()
+                    if torch.is_tensor(report_loss)
+                    else float(report_loss)
+                )
+                if report_weight is not None:
+                    self._context_parallel_last_loss_weight = (
+                        report_weight.detach().item()
+                        if torch.is_tensor(report_weight)
+                        else float(report_weight)
+                    )
         if report_loss is not None:
             return report_loss
         return loss
+
+    @functools.wraps(original_log)
+    def patched_log(self, logs):
+        manager = getattr(self, "_context_parallel_manager", None)
+        if (
+            manager
+            and logs is not None
+            and "loss" in logs
+            and hasattr(self, "_context_parallel_last_loss")
+        ):
+            logs = dict(logs)
+            logs["loss"] = self._context_parallel_last_loss
+            delattr(self, "_context_parallel_last_loss")
+            if hasattr(self, "_context_parallel_last_loss_weight"):
+                delattr(self, "_context_parallel_last_loss_weight")
+        return original_log(self, logs)
 
     def enable_context_parallel(self, **kwargs):
         settings = ContextParallelSettings(**kwargs)
@@ -504,5 +557,6 @@ def _patch_sft_trainer(trl_module) -> None:
     trainer_cls.compute_loss = patched_compute_loss
     trainer_cls.prediction_step = patched_prediction_step
     trainer_cls.training_step = patched_training_step
+    trainer_cls.log = patched_log
     trainer_cls.enable_context_parallel = enable_context_parallel
     trainer_cls.__unsloth_context_parallel__ = True
