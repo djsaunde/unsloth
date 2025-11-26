@@ -281,9 +281,6 @@ class ContextParallelManager:
         if local_tokens is None:
             self._cached_num_items = None
             return
-        if self.settings.size > 1 and self._cp_group is not None:
-            dist.all_reduce(local_tokens, op = dist.ReduceOp.SUM, group = self._cp_group)
-            local_tokens = local_tokens / float(self.settings.size)
         value = inputs["num_items_in_batch"]
         if torch.is_tensor(value):
             local_tokens = local_tokens.to(device = value.device, dtype = value.dtype)

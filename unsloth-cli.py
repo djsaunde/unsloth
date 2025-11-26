@@ -117,6 +117,30 @@ def run(args):
     dataset = dataset.map(formatting_prompts_func, batched = True)
     print("Data is formatted and ready!")
 
+    # Configure parallelism env for context parallel runs (mirrors Axolotl setup)
+    if args.context_parallel_size > 1:
+        try:
+            import torch.distributed as dist
+
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+        except Exception:
+            world_size = 1
+        dp_replicate = max(1, world_size // args.context_parallel_size)
+        env_overrides = {
+            "ACCELERATE_USE_PARALLELISM_CONFIG": "true",
+            "ACCELERATE_ALLOW_CP_STANDALONE": "true",
+            "PARALLELISM_CONFIG_CP_SIZE": str(args.context_parallel_size),
+            "PARALLELISM_CONFIG_DP_REPLICATE_SIZE": str(dp_replicate),
+            "PARALLELISM_CONFIG_DP_SHARD_SIZE": os.environ.get(
+                "PARALLELISM_CONFIG_DP_SHARD_SIZE", "1"
+            ),
+            "PARALLELISM_CONFIG_TP_SIZE": os.environ.get(
+                "PARALLELISM_CONFIG_TP_SIZE", "1"
+            ),
+        }
+        for key, value in env_overrides.items():
+            os.environ.setdefault(key, value)
+
     # Detect whether we're running under torch.distributed so we can tweak trainer defaults.
     try:
         import torch.distributed as dist
