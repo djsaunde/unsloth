@@ -33,6 +33,14 @@ import argparse
 import os
 
 
+def _parse_comma_separated(value):
+    if value is None:
+        return tuple()
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    return tuple(x.strip() for x in value.split(",") if x.strip())
+
+
 def run(args):
     from unsloth import FastLanguageModel
     from datasets import load_dataset
@@ -130,6 +138,10 @@ def run(args):
         dataset_num_proc = 2,
         ddp_find_unused_parameters = False if distributed else None,
         packing = args.packing,
+        context_parallel_size = args.context_parallel_size,
+        context_parallel_seq_dim = args.context_parallel_seq_dim,
+        context_parallel_buffer_names = args.context_parallel_buffer_names,
+        context_parallel_no_restore = args.context_parallel_no_restore,
     )
 
     # Initialize trainer
@@ -338,6 +350,42 @@ if __name__ == "__main__":
         help = "Enable padding-free sample packing via TRL's bin packer.",
     )
 
+    context_group = parser.add_argument_group("🧩 Context Parallelism")
+    context_group.add_argument(
+        "--context_parallel_size",
+        type = int,
+        default = 1,
+        help = (
+            "Number of distributed ranks used for context parallelism. "
+            "Set >1 only when launching with torchrun/accelerate and running PyTorch >= 2.4."
+        ),
+    )
+    context_group.add_argument(
+        "--context_parallel_seq_dim",
+        type = int,
+        default = 1,
+        help = "Sequence dimension for tensors that should be sharded across context-parallel ranks.",
+    )
+    context_group.add_argument(
+        "--context_parallel_buffer_names",
+        type = _parse_comma_separated,
+        default = ("input_ids", "attention_mask", "labels"),
+        help = (
+            "Comma-separated batch keys to shard when context parallelism is enabled. "
+            "Example: input_ids,attention_mask,labels"
+        ),
+    )
+    context_group.add_argument(
+        "--context_parallel_no_restore",
+        type = _parse_comma_separated,
+        default = tuple(),
+        help = (
+            "Comma-separated subset of --context_parallel_buffer_names that do not need to be restored "
+            "after leaving the context parallel region."
+        ),
+    )
+
+    # Report/Logging arguments
     report_group = parser.add_argument_group("📊 Report Options")
     report_group.add_argument(
         "--report_to",
