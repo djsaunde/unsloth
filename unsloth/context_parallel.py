@@ -115,6 +115,7 @@ class ContextParallelManager:
         self._cp_group: Optional[dist.ProcessGroup] = None
         self._cp_rank_index: int = 0
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
+        self._last_report_loss: Optional[torch.Tensor] = None
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
@@ -252,7 +253,7 @@ class ContextParallelManager:
                 return weight.to(device = reference.device, dtype = reference.dtype)
         return None
 
-    def reduce_loss(self, loss, inputs):
+    def _compute_report_loss(self, loss, inputs):
         if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
             return loss
 
@@ -277,6 +278,34 @@ class ContextParallelManager:
         elif torch.is_tensor(loss):
             return _reduce_tensor(loss)
         return loss
+
+    def prepare_loss_for_backward(self, loss, inputs):
+        report_loss = self._compute_report_loss(loss, inputs)
+
+        def _scale(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor is None or not torch.is_tensor(tensor):
+                return tensor
+            if self.settings.size <= 1:
+                return tensor
+            return tensor * self.settings.size
+
+        if isinstance(report_loss, tuple):
+            scaled = (_scale(report_loss[0]), *report_loss[1:])
+            report_value = (
+                report_loss[0].detach() if torch.is_tensor(report_loss[0]) else None
+            )
+        else:
+            scaled = _scale(report_loss)
+            report_value = (
+                report_loss.detach() if torch.is_tensor(report_loss) else None
+            )
+        self._last_report_loss = report_value
+        return scaled
+
+    def consume_report_loss(self) -> Optional[torch.Tensor]:
+        value = self._last_report_loss
+        self._last_report_loss = None
+        return value
 
 
 def patch_trl_for_context_parallel() -> None:
@@ -360,6 +389,7 @@ def _patch_sft_trainer(trl_module) -> None:
     original_compute_loss = trainer_cls.compute_loss
     original_prediction_step = trainer_cls.prediction_step
     original_get_train_sampler = getattr(trainer_cls, "_get_train_sampler", None)
+    original_training_step = trainer_cls.training_step
 
     @functools.wraps(original_init)
     def patched_init(self, *args, **kwargs):
@@ -398,7 +428,7 @@ def _patch_sft_trainer(trl_module) -> None:
                 **kwargs,
             )
         if manager:
-            loss = manager.reduce_loss(loss, inputs)
+            loss = manager.prepare_loss_for_backward(loss, inputs)
         return loss
 
     @functools.wraps(original_prediction_step)
@@ -422,6 +452,15 @@ def _patch_sft_trainer(trl_module) -> None:
                 **kwargs,
             )
 
+    @functools.wraps(original_training_step)
+    def patched_training_step(self, *args, **kwargs):
+        loss = original_training_step(self, *args, **kwargs)
+        manager = getattr(self, "_context_parallel_manager", None)
+        report_loss = manager.consume_report_loss() if manager else None
+        if report_loss is not None:
+            return report_loss
+        return loss
+
     def enable_context_parallel(self, **kwargs):
         settings = ContextParallelSettings(**kwargs)
         self._context_parallel_manager = ContextParallelManager(settings)
@@ -429,5 +468,6 @@ def _patch_sft_trainer(trl_module) -> None:
     trainer_cls.__init__ = patched_init
     trainer_cls.compute_loss = patched_compute_loss
     trainer_cls.prediction_step = patched_prediction_step
+    trainer_cls.training_step = patched_training_step
     trainer_cls.enable_context_parallel = enable_context_parallel
     trainer_cls.__unsloth_context_parallel__ = True
