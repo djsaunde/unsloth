@@ -280,9 +280,6 @@ class ContextParallelManager:
         if local_tokens is None:
             self._cached_num_items = None
             return
-        if self._cp_group is not None:
-            dist.all_reduce(local_tokens, op = dist.ReduceOp.SUM, group = self._cp_group)
-            local_tokens = local_tokens / float(self.settings.size)
         value = inputs["num_items_in_batch"]
         if torch.is_tensor(value):
             local_tokens = local_tokens.to(device = value.device, dtype = value.dtype)
@@ -488,12 +485,12 @@ def _patch_sft_trainer(trl_module) -> None:
         manager = getattr(self, "_context_parallel_manager", None)
         original_n_gpu = getattr(self.args, "n_gpu", 1)
         if manager:
-            setattr(self.args, "n_gpu", manager.data_parallel_world_size)
+            setattr(self.args, "_n_gpu", manager.data_parallel_world_size)
         try:
             loss = original_training_step(self, *args, **kwargs)
         finally:
             if manager:
-                setattr(self.args, "n_gpu", original_n_gpu)
+                setattr(self.args, "_n_gpu", original_n_gpu)
         report_loss = manager.consume_report_loss() if manager else None
         if report_loss is not None:
             return report_loss
