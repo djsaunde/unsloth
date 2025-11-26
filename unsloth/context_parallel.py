@@ -18,6 +18,7 @@ except (ImportError, AttributeError):  # pragma: no cover - handled at runtime
     DeviceMesh = None  # type: ignore[assignment]
 
 from .device_type import DEVICE_TYPE_TORCH
+from .samplers import ContextParallelDistributedSampler
 
 
 def _torch_version() -> Version:
@@ -275,6 +276,7 @@ def _patch_sft_trainer(trl_module) -> None:
     original_init = trainer_cls.__init__
     original_compute_loss = trainer_cls.compute_loss
     original_prediction_step = trainer_cls.prediction_step
+    original_get_train_sampler = trainer_cls.get_train_sampler
 
     @functools.wraps(original_init)
     def patched_init(self, *args, **kwargs):
@@ -325,4 +327,26 @@ def _patch_sft_trainer(trl_module) -> None:
     trainer_cls.compute_loss = patched_compute_loss
     trainer_cls.prediction_step = patched_prediction_step
     trainer_cls.enable_context_parallel = enable_context_parallel
+    trainer_cls.get_train_sampler = _build_get_train_sampler(original_get_train_sampler)
     trainer_cls.__unsloth_context_parallel__ = True
+
+
+def _build_get_train_sampler(original_get_train_sampler):
+    def patched_get_train_sampler(self):
+        sampler = original_get_train_sampler(self)
+        manager = getattr(self, "_context_parallel_manager", None)
+        if manager is None or not manager.enabled:
+            return sampler
+        dataset = getattr(self, "train_dataset", None)
+        if dataset is None:
+            return sampler
+        return ContextParallelDistributedSampler(
+            dataset,
+            num_replicas = self.args.world_size,
+            rank = self.args.process_index,
+            context_parallel_size = manager.settings.size,
+            seed = self.args.seed,
+            drop_last = self.args.dataloader_drop_last,
+        )
+
+    return patched_get_train_sampler
