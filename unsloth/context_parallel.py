@@ -534,7 +534,7 @@ def _patch_sft_trainer(trl_module) -> None:
         return loss
 
     @functools.wraps(original_log)
-    def patched_log(self, logs):
+    def patched_log(self, logs, start_time = None):
         manager = getattr(self, "_context_parallel_manager", None)
         if (
             manager
@@ -547,7 +547,7 @@ def _patch_sft_trainer(trl_module) -> None:
             delattr(self, "_context_parallel_last_loss")
             if hasattr(self, "_context_parallel_last_loss_weight"):
                 delattr(self, "_context_parallel_last_loss_weight")
-        return original_log(self, logs)
+        return original_log(self, logs, start_time)
 
     def enable_context_parallel(self, **kwargs):
         settings = ContextParallelSettings(**kwargs)
