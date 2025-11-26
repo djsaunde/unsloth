@@ -114,6 +114,7 @@ class ContextParallelManager:
         self._accelerate_mesh: Optional[DeviceMesh] = None
         self._cp_group: Optional[dist.ProcessGroup] = None
         self._cp_rank_index: int = 0
+        self._dp_world_size: int = 1
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._cached_num_items: Optional[torch.Tensor | float | int] = None
         self._report_loss: Optional[torch.Tensor] = None
@@ -177,6 +178,7 @@ class ContextParallelManager:
             dp_world_size,
             self.settings.size,
         )
+        self._dp_world_size = dp_world_size
         return DeviceMesh(
             DEVICE_TYPE_TORCH,
             mesh,
@@ -189,6 +191,10 @@ class ContextParallelManager:
     @property
     def accelerate_mesh(self) -> Optional[DeviceMesh]:
         return self._accelerate_mesh
+
+    @property
+    def data_parallel_world_size(self) -> int:
+        return self._dp_world_size
 
     def _collect_buffers(
         self, inputs: dict[str, torch.Tensor]
@@ -274,6 +280,9 @@ class ContextParallelManager:
         if local_tokens is None:
             self._cached_num_items = None
             return
+        if self._cp_group is not None:
+            dist.all_reduce(local_tokens, op = dist.ReduceOp.SUM, group = self._cp_group)
+            local_tokens = local_tokens / float(self.settings.size)
         value = inputs["num_items_in_batch"]
         if torch.is_tensor(value):
             local_tokens = local_tokens.to(device = value.device, dtype = value.dtype)
@@ -476,8 +485,15 @@ def _patch_sft_trainer(trl_module) -> None:
 
     @functools.wraps(original_training_step)
     def patched_training_step(self, *args, **kwargs):
-        loss = original_training_step(self, *args, **kwargs)
         manager = getattr(self, "_context_parallel_manager", None)
+        original_n_gpu = getattr(self.args, "n_gpu", 1)
+        if manager:
+            setattr(self.args, "n_gpu", manager.data_parallel_world_size)
+        try:
+            loss = original_training_step(self, *args, **kwargs)
+        finally:
+            if manager:
+                setattr(self.args, "n_gpu", original_n_gpu)
         report_loss = manager.consume_report_loss() if manager else None
         if report_loss is not None:
             return report_loss
