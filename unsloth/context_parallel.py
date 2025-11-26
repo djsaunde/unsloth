@@ -18,7 +18,6 @@ except (ImportError, AttributeError):  # pragma: no cover - handled at runtime
     DeviceMesh = None  # type: ignore[assignment]
 
 from .device_type import DEVICE_TYPE_TORCH
-from .samplers import ContextParallelDistributedSampler
 
 
 def _torch_version() -> Version:
@@ -111,10 +110,12 @@ class ContextParallelManager:
             and settings.size > 1
         )
         self._mesh: Optional[DeviceMesh] = None
+        self._accelerate_mesh: Optional[DeviceMesh] = None
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
+            self._accelerate_mesh = self._build_accelerate_mesh()
 
     def _verify_environment(self) -> None:
         if not self.enabled:
@@ -157,8 +158,29 @@ class ContextParallelManager:
         cp_ranks = torch.arange(start, start + self.settings.size, dtype = torch.int64)
         return DeviceMesh(DEVICE_TYPE_TORCH, cp_ranks)
 
+    def _build_accelerate_mesh(self) -> Optional[DeviceMesh]:
+        if not self.enabled:
+            return None
+        world_size = torch.distributed.get_world_size()
+        if world_size % self.settings.size != 0:
+            return None
+        dp_world_size = world_size // self.settings.size
+        mesh = torch.arange(world_size, dtype = torch.int64).reshape(
+            dp_world_size,
+            self.settings.size,
+        )
+        return DeviceMesh(
+            DEVICE_TYPE_TORCH,
+            mesh,
+            mesh_dim_names = ("dp_replicate", "cp"),
+        )
+
     def __bool__(self) -> bool:
         return self.enabled
+
+    @property
+    def accelerate_mesh(self) -> Optional[DeviceMesh]:
+        return self._accelerate_mesh
 
     def _collect_buffers(
         self, inputs: dict[str, torch.Tensor]
@@ -284,6 +306,20 @@ def _patch_sft_trainer(trl_module) -> None:
         self._context_parallel_manager = ContextParallelManager(
             ContextParallelSettings.from_args(getattr(self, "args", None))
         )
+        accelerator = getattr(self, "accelerator", None)
+        manager = getattr(self, "_context_parallel_manager", None)
+        mesh = getattr(manager, "accelerate_mesh", None) if manager else None
+        if (
+            accelerator is not None
+            and mesh is not None
+            and (
+                not hasattr(accelerator, "torch_device_mesh")
+                or accelerator.torch_device_mesh is None
+                or "cp"
+                not in getattr(accelerator.torch_device_mesh, "mesh_dim_names", ())
+            )
+        ):
+            accelerator.torch_device_mesh = mesh
 
     @functools.wraps(original_compute_loss)
     def patched_compute_loss(self, model, inputs, return_outputs = False, **kwargs):
@@ -327,29 +363,4 @@ def _patch_sft_trainer(trl_module) -> None:
     trainer_cls.compute_loss = patched_compute_loss
     trainer_cls.prediction_step = patched_prediction_step
     trainer_cls.enable_context_parallel = enable_context_parallel
-    if original_get_train_sampler is not None:
-        trainer_cls._get_train_sampler = _build_get_train_sampler(
-            original_get_train_sampler
-        )
     trainer_cls.__unsloth_context_parallel__ = True
-
-
-def _build_get_train_sampler(original_get_train_sampler):
-    def patched_get_train_sampler(self, train_dataset = None):
-        sampler = original_get_train_sampler(self, train_dataset = train_dataset)
-        manager = getattr(self, "_context_parallel_manager", None)
-        if manager is None or not manager.enabled:
-            return sampler
-        dataset = getattr(self, "train_dataset", None)
-        if dataset is None:
-            return sampler
-        return ContextParallelDistributedSampler(
-            dataset,
-            num_replicas = self.args.world_size,
-            rank = self.args.process_index,
-            context_parallel_size = manager.settings.size,
-            seed = self.args.seed,
-            drop_last = self.args.dataloader_drop_last,
-        )
-
-    return patched_get_train_sampler
