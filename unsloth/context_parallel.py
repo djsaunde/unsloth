@@ -113,6 +113,7 @@ class ContextParallelManager:
         self._mesh: Optional[DeviceMesh] = None
         self._accelerate_mesh: Optional[DeviceMesh] = None
         self._cp_group: Optional[dist.ProcessGroup] = None
+        self._cp_rank_index: int = 0
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._verify_environment()
         if self.enabled:
@@ -160,6 +161,7 @@ class ContextParallelManager:
         cp_ranks = torch.arange(start, start + self.settings.size, dtype = torch.int64)
         mesh = DeviceMesh(DEVICE_TYPE_TORCH, cp_ranks)
         self._cp_group = mesh.get_group()
+        self._cp_rank_index = int(rank - start)
         return mesh
 
     def _build_accelerate_mesh(self) -> Optional[DeviceMesh]:
@@ -221,15 +223,29 @@ class ContextParallelManager:
         ):
             yield
 
+    def _rank_slice(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if tensor is None or not torch.is_tensor(tensor):
+            return None
+        if tensor.ndim <= self.settings.seq_dim:
+            return tensor
+        seq_len = tensor.size(self.settings.seq_dim)
+        if seq_len % self.settings.size != 0:
+            raise RuntimeError(
+                "Sequence length must be divisible by context_parallel_size when computing loss weights."
+            )
+        chunk = seq_len // self.settings.size
+        start = self._cp_rank_index * chunk
+        return tensor.narrow(self.settings.seq_dim, start, chunk)
+
     def _loss_weight(self, inputs: dict[str, torch.Tensor], reference: torch.Tensor):
         if not isinstance(reference, torch.Tensor):
             return None
-        labels = inputs.get("labels")
+        labels = self._rank_slice(inputs.get("labels"))
         if isinstance(labels, torch.Tensor):
             weight = labels.ne(-100).sum()
             if weight.item() > 0:
                 return weight.to(device = reference.device, dtype = reference.dtype)
-        attention_mask = inputs.get("attention_mask")
+        attention_mask = self._rank_slice(inputs.get("attention_mask"))
         if isinstance(attention_mask, torch.Tensor):
             weight = attention_mask.sum()
             if weight.item() > 0:
