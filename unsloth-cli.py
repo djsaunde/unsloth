@@ -31,6 +31,7 @@ Happy fine-tuning!
 
 import argparse
 import os
+from typing import Optional
 
 
 def run(args):
@@ -45,12 +46,31 @@ def run(args):
 
     logging.getLogger("hf-to-gguf").setLevel(logging.WARNING)
 
+    def _prepare_device_map() -> Optional[dict]:
+        """Load quantized checkpoints directly onto the local device."""
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)) or 0)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(local_rank)
+            except Exception:
+                pass
+            return {"": torch.cuda.current_device()}
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                torch.xpu.set_device(local_rank)
+            except Exception:
+                pass
+            return {"": f"xpu:{torch.xpu.current_device()}"}
+        return None
+
     # Load model and tokenizer
+    device_map = _prepare_device_map()
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = args.model_name,
         max_seq_length = args.max_seq_length,
         dtype = args.dtype,
         load_in_4bit = args.load_in_4bit,
+        device_map = device_map,
     )
 
     # Configure PEFT model
@@ -109,7 +129,24 @@ def run(args):
     dataset = dataset.map(formatting_prompts_func, batched = True)
     print("Data is formatted and ready!")
 
+    # Detect distributed context to tweak trainer defaults
+    try:
+        import torch.distributed as dist
+
+        distributed = dist.is_available() and dist.is_initialized()
+    except Exception:
+        distributed = False
+
     # Configure training arguments
+    pad_multiple = args.pad_to_multiple_of
+    if pad_multiple is None and args.context_parallel_size > 1:
+        pad_multiple = 2 * args.context_parallel_size
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"Context parallelism enabled with size {args.context_parallel_size}; "
+                f"auto-setting pad_to_multiple_of={pad_multiple}."
+            )
+
     training_args = SFTConfig(
         per_device_train_batch_size = args.per_device_train_batch_size,
         gradient_accumulation_steps = args.gradient_accumulation_steps,
@@ -127,7 +164,11 @@ def run(args):
         report_to = args.report_to,
         max_length = args.max_seq_length,
         dataset_num_proc = 2,
+        ddp_find_unused_parameters = False if distributed else None,
         packing = False,
+        context_parallel_size = args.context_parallel_size,
+        pad_to_multiple_of = pad_multiple,
+        shuffle_dataset = args.shuffle_dataset,
     )
 
     # Initialize trainer
@@ -308,6 +349,35 @@ if __name__ == "__main__":
         type = int,
         default = 3407,
         help = "Seed for reproducibility, default is 3407.",
+    )
+    training_group.add_argument(
+        "--pad_to_multiple_of",
+        type = int,
+        default = None,
+        help = (
+            "Pad every batch to a multiple of this value. "
+            "Defaults to `2 * context_parallel_size` when context parallelism is enabled."
+        ),
+    )
+    training_group.add_argument(
+        "--shuffle_dataset",
+        action = argparse.BooleanOptionalAction,
+        default = True,
+        help = (
+            "Shuffle the training dataset each epoch (default True). "
+            "Disable when comparing runs that must see identical batches."
+        ),
+    )
+
+    context_group = parser.add_argument_group("🧩 Context Parallelism")
+    context_group.add_argument(
+        "--context_parallel_size",
+        type = int,
+        default = 1,
+        help = (
+            "Number of distributed ranks participating in PyTorch context parallelism. "
+            "Set >1 only when running with torch.distributed initialized on PyTorch >= 2.4."
+        ),
     )
 
     # Report/Logging arguments

@@ -61,6 +61,7 @@ from transformers.modeling_attn_mask_utils import (
 )
 from ..kernels import *
 from ..tokenizer_utils import *
+from ..context_parallel import is_context_parallel_active, _cp_debug_enabled
 
 if HAS_FLASH_ATTENTION:
     from flash_attn import flash_attn_func
@@ -596,7 +597,35 @@ def LlamaAttention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    if not HAS_FLASH_ATTENTION and HAS_XFORMERS and attention_mask is None:
+    cp_active = is_context_parallel_active()
+    use_xformers = (
+        not cp_active
+        and not HAS_FLASH_ATTENTION
+        and HAS_XFORMERS
+        and attention_mask is None
+    )
+    use_flash = (not cp_active) and HAS_FLASH_ATTENTION and attention_mask is None
+
+    if _cp_debug_enabled():
+        backend = "sdpa"
+        reason = (
+            "forced by context parallel"
+            if cp_active
+            else "mask or backend requirements"
+        )
+        if use_xformers:
+            backend = "xformers"
+            reason = ""
+        elif use_flash:
+            backend = "flash_attention"
+            reason = ""
+        print(
+            f"[CP-DEBUG] attention backend={backend} (cp_active={cp_active}, HAS_FLASH={HAS_FLASH_ATTENTION}, HAS_XFORMERS={HAS_XFORMERS}, "
+            f"attn_mask={'present' if attention_mask is not None else 'none'}) {reason}",
+            flush = True,
+        )
+
+    if use_xformers:
         # Xformers memory efficient attention
         # Also has Flash Attention v2 dispatching
         Q = Q.transpose(1, 2)
@@ -617,7 +646,7 @@ def LlamaAttention_fast_forward(
         A = xformers_attention(Q, K, V, attn_bias = causal_mask)
         A = A.view(bsz, q_len, n_heads, head_dim)
 
-    elif HAS_FLASH_ATTENTION and attention_mask is None:
+    elif use_flash:
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
         V = V.transpose(1, 2)
