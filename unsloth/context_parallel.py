@@ -326,6 +326,9 @@ class ContextParallelManager:
                 raise RuntimeError(
                     f"Context parallel buffers differ across ranks before sharding (rank {idx} mismatch)."
                 )
+        _cp_debug(
+            f"[CP-DEBUG][cp-rank={self._cp_rank_index}] pre-shard buffers match across {self.settings.size} ranks."
+        )
 
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
