@@ -192,8 +192,11 @@ def _cp_should_use_reference_rms(layer) -> bool:
     manager = get_active_context_parallel_manager()
     if not (manager and manager.enabled):
         return False
+    mode = os.environ.get("UNSLOTH_CP_REF_RMS_MODE", "all").lower()
     layer_id = getattr(layer, "layer_idx", None)
-    return layer_id in (0, None)
+    if mode == "layer0":
+        return layer_id == 0
+    return True
 
 
 if HAS_FLASH_ATTENTION:
