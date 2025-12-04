@@ -579,6 +579,23 @@ def LlamaAttention_fast_forward(
     cp_size = cp_manager.settings.size if cp_manager else 1
     cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
 
+    def _cp_log_tensor(tag: str, tensor: torch.Tensor, seq_dim: int) -> None:
+        if not _cp_debug_enabled() or not torch.is_tensor(tensor):
+            return
+        checksum = tensor.detach().float().sum().item()
+        shape = tuple(tensor.shape)
+        if cp_active or tensor.size(seq_dim) % 2 != 0:
+            _cp_debug(
+                f"[CP-DEBUG][attn-in] rank={cp_rank_index}/{cp_size} layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f}"
+            )
+            return
+        half = tensor.size(seq_dim) // 2
+        first = tensor.narrow(seq_dim, 0, half).detach().float().sum().item()
+        second = tensor.narrow(seq_dim, half, half).detach().float().sum().item()
+        _cp_debug(
+            f"[CP-DEBUG][attn-in] rank=0/1 layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f} halves=({first:.6f},{second:.6f})"
+        )
+
     if (
         cp_active
         and os.environ.get("UNSLOTH_CP_BREAKPOINT")
@@ -645,6 +662,9 @@ def LlamaAttention_fast_forward(
 
     cos, sin = _slice_rope_frequencies(cos, sin)
     Q, K = fast_rope_embedding(Q, K, cos, sin)
+    _cp_log_tensor("Q", Q, -2)
+    _cp_log_tensor("K", K, -2)
+    _cp_log_tensor("V", V, -2)
 
     if past_key_value is not None:
         K = torch.cat([past_key_value[0], K], dim = 2)
