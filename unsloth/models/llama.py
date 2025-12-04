@@ -70,6 +70,14 @@ from ..context_parallel import (
 )
 
 
+def _cp_target_layers(config) -> set[int]:
+    layers = {0}
+    total = getattr(config, "num_hidden_layers", None)
+    if isinstance(total, int) and total > 0:
+        layers.add(max(0, total - 1))
+    return layers
+
+
 def _cp_reconstruct_tensor_for_logging(
     tensor: torch.Tensor,
     seq_dim: int,
@@ -982,6 +990,7 @@ def LlamaAttention_fast_forward(
     cp_active = bool(cp_manager and cp_manager.enabled)
     cp_size = cp_manager.settings.size if cp_manager else 1
     cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
+    focus_layers = _cp_target_layers(self.config)
 
     def _cp_log_tensor(tag: str, tensor: torch.Tensor, seq_dim: int) -> None:
         if not _cp_debug_enabled() or not torch.is_tensor(tensor):
@@ -990,7 +999,7 @@ def LlamaAttention_fast_forward(
         if mode == "off":
             return
         layer_id = getattr(self, "layer_idx", None)
-        if mode == "focused" and layer_id != 0:
+        if mode == "focused" and layer_id not in focus_layers:
             return
         if tensor.ndim == 0:
             seq_len = 0
@@ -1215,7 +1224,7 @@ def LlamaAttention_fast_forward(
         mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
         if mode == "off":
             pass
-        elif mode == "focused" and layer_id != 0:
+        elif mode == "focused" and layer_id not in focus_layers:
             pass
         else:
             prefix = "[CP-DEBUG][attn-out]"
@@ -1303,12 +1312,11 @@ def LlamaDecoderLayer_fast_forward(
         past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
     """
 
-    def _cp_log_layernorm(stage: str, tensor: torch.Tensor) -> None:
-        return
+    focus_layers = _cp_target_layers(self.config)
 
     def _cp_log_rms_inputs(stage: str, tensor: torch.Tensor, norm_module) -> None:
         layer_id = getattr(self, "layer_idx", None)
-        if layer_id != 0:
+        if layer_id not in focus_layers:
             return
         _cp_log_sequence_tensor(
             f"rms.{stage}.input.layer={layer_id}",
@@ -1327,7 +1335,7 @@ def LlamaDecoderLayer_fast_forward(
 
     def _cp_log_rms_output(stage: str, tensor: torch.Tensor) -> None:
         layer_id = getattr(self, "layer_idx", None)
-        if layer_id != 0:
+        if layer_id not in focus_layers:
             return
         _cp_log_sequence_tensor(
             f"rms.{stage}.output.layer={layer_id}",
@@ -1338,7 +1346,7 @@ def LlamaDecoderLayer_fast_forward(
 
     def _cp_log_residual(tag: str, tensor: torch.Tensor) -> None:
         layer_id = getattr(self, "layer_idx", None)
-        if layer_id != 0:
+        if layer_id not in focus_layers:
             return
         _cp_log_sequence_tensor(
             f"residual.{tag}.layer={layer_id}",
@@ -1356,7 +1364,7 @@ def LlamaDecoderLayer_fast_forward(
     if (
         use_reference_rms
         and focus_logging
-        and layer_id == 0
+        and layer_id in focus_layers
         and not getattr(self, "_cp_reference_rms_logged", False)
     ):
         setattr(self, "_cp_reference_rms_logged", True)
