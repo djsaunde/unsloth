@@ -910,19 +910,31 @@ def LlamaDecoderLayer_fast_forward(
     """
 
     def _cp_log_layernorm(stage: str, tensor: torch.Tensor) -> None:
+        return
+
+    def _cp_log_rms_inputs(stage: str, tensor: torch.Tensor, norm_module) -> None:
         layer_id = getattr(self, "layer_idx", None)
         if layer_id not in (0, None):
             return
         _cp_log_sequence_tensor(
-            f"ln.{stage}.layer={layer_id}",
+            f"rms.{stage}.input.layer={layer_id}",
             tensor,
             1,
             focus = True,
         )
+        weight = getattr(norm_module, "weight", None)
+        if torch.is_tensor(weight):
+            _cp_log_sequence_tensor(
+                f"rms.{stage}.weight.layer={layer_id}",
+                weight,
+                0,
+                focus = True,
+            )
 
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
         _cp_log_layernorm("input.pre", hidden_states)
+        _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
         hidden_states = fast_rms_layernorm_inference(
             self.input_layernorm, hidden_states
         )
@@ -943,6 +955,7 @@ def LlamaDecoderLayer_fast_forward(
         # Fully Connected
         residual = hidden_states
         _cp_log_layernorm("post.pre", hidden_states)
+        _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
         hidden_states = fast_rms_layernorm_inference(
             self.post_attention_layernorm, hidden_states
         )
@@ -952,6 +965,7 @@ def LlamaDecoderLayer_fast_forward(
     else:
         residual = hidden_states
         _cp_log_layernorm("input.pre", hidden_states)
+        _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
         hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
         _cp_log_layernorm("input.post", hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -970,6 +984,7 @@ def LlamaDecoderLayer_fast_forward(
         # Fully Connected
         residual = hidden_states
         _cp_log_layernorm("post.pre", hidden_states)
+        _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
         hidden_states = fast_rms_layernorm(self.post_attention_layernorm, hidden_states)
         _cp_log_layernorm("post.post", hidden_states)
         hidden_states = self.mlp(hidden_states)
