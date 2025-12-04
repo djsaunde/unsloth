@@ -67,6 +67,43 @@ from ..context_parallel import (
     _cp_debug,
 )
 
+
+def _cp_log_sequence_tensor(
+    tag: str,
+    tensor: Optional[torch.Tensor],
+    seq_dim: int = 1,
+) -> None:
+    if not (_cp_debug_enabled() and torch.is_tensor(tensor)):
+        return
+    manager = get_active_context_parallel_manager()
+    cp_active = bool(manager and manager.enabled)
+    cp_size = manager.settings.size if manager else 1
+    cp_rank_index = manager.cp_rank_index if manager else 0
+    shape = tuple(tensor.shape)
+    checksum = tensor.detach().float().sum().item()
+    prefix = f"[CP-DEBUG][{tag}]"
+    if tensor.ndim == 0:
+        seq_len = 0
+        seq_dim_resolved = 0
+    else:
+        seq_dim_resolved = seq_dim % tensor.ndim
+        seq_len = tensor.size(seq_dim_resolved)
+    if cp_active:
+        _cp_debug(
+            f"{prefix} rank={cp_rank_index}/{cp_size} shape={shape} checksum={checksum:.6f}"
+        )
+        return
+    message = f"{prefix} rank=0/1 shape={shape} checksum={checksum:.6f}"
+    if seq_len > 0 and seq_len % 2 == 0:
+        half = seq_len // 2
+        first = tensor.narrow(seq_dim_resolved, 0, half).detach().float().sum().item()
+        second = (
+            tensor.narrow(seq_dim_resolved, half, half).detach().float().sum().item()
+        )
+        message += f" halves=({first:.6f},{second:.6f})"
+    _cp_debug(message)
+
+
 if HAS_FLASH_ATTENTION:
     from flash_attn import flash_attn_func
 from .vision import FastBaseModel
@@ -811,11 +848,20 @@ def LlamaDecoderLayer_fast_forward(
             (see `past_key_values`).
         past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
     """
+
+    def _cp_log_layernorm(stage: str, tensor: torch.Tensor) -> None:
+        layer_id = getattr(self, "layer_idx", None)
+        if layer_id not in (0, None):
+            return
+        _cp_log_sequence_tensor(f"ln.{stage}.layer={layer_id}", tensor, 1)
+
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
+        _cp_log_layernorm("input.pre", hidden_states)
         hidden_states = fast_rms_layernorm_inference(
             self.input_layernorm, hidden_states
         )
+        _cp_log_layernorm("input.post", hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
             causal_mask = causal_mask,
@@ -831,14 +877,18 @@ def LlamaDecoderLayer_fast_forward(
 
         # Fully Connected
         residual = hidden_states
+        _cp_log_layernorm("post.pre", hidden_states)
         hidden_states = fast_rms_layernorm_inference(
             self.post_attention_layernorm, hidden_states
         )
+        _cp_log_layernorm("post.post", hidden_states)
         hidden_states = fast_swiglu_inference(self.mlp, hidden_states)
         hidden_states += residual
     else:
         residual = hidden_states
+        _cp_log_layernorm("input.pre", hidden_states)
         hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
+        _cp_log_layernorm("input.post", hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
             causal_mask = causal_mask,
@@ -854,7 +904,9 @@ def LlamaDecoderLayer_fast_forward(
 
         # Fully Connected
         residual = hidden_states
+        _cp_log_layernorm("post.pre", hidden_states)
         hidden_states = fast_rms_layernorm(self.post_attention_layernorm, hidden_states)
+        _cp_log_layernorm("post.post", hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -980,6 +1032,7 @@ def LlamaModel_fast_forward(
     # Embed positions
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
+    _cp_log_sequence_tensor("embed", inputs_embeds, 1)
 
     inputs_embeds = inputs_embeds.to(_get_dtype(dtype_from_config(self.config)))
 
