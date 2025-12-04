@@ -8,6 +8,7 @@ from typing import Iterator, Optional, Tuple
 import sys
 import os
 import contextvars
+import hashlib
 
 import torch
 from packaging.version import Version
@@ -284,13 +285,50 @@ class ContextParallelManager:
         seq_len = input_ids.size(self.settings.seq_dim)
         if seq_len <= 0:
             return
-        device = input_ids.device
-        dtype = torch.int32
-        positions = torch.arange(seq_len, dtype = dtype, device = device)
-        view_shape = [1] * input_ids.ndim
-        view_shape[self.settings.seq_dim] = seq_len
-        positions = positions.view(view_shape).expand_as(input_ids).clone()
-        inputs["position_ids"] = positions
+        attention_mask = inputs.get("attention_mask")
+        dtype = torch.long
+        if (
+            isinstance(attention_mask, torch.Tensor)
+            and attention_mask.shape == input_ids.shape
+        ):
+            mask = attention_mask.to(dtype = dtype)
+            positions = mask.cumsum(dim = self.settings.seq_dim) - 1
+            positions.masked_fill_(mask == 0, 0)
+        else:
+            device = input_ids.device
+            base = torch.arange(seq_len, dtype = dtype, device = device)
+            view_shape = [1] * input_ids.ndim
+            view_shape[self.settings.seq_dim] = seq_len
+            positions = base.view(view_shape).expand_as(input_ids)
+        inputs["position_ids"] = positions.to(dtype = torch.long)
+
+    def _debug_validate_buffers(
+        self,
+        buffers: list[torch.Tensor],
+    ) -> None:
+        if not _cp_debug_enabled():
+            return
+        if not buffers or self._cp_group is None:
+            return
+        summaries: list[tuple] = []
+        for tensor in buffers:
+            if not torch.is_tensor(tensor):
+                continue
+            cpu_tensor = tensor.detach().to("cpu").contiguous()
+            checksum = hashlib.sha256(cpu_tensor.numpy().tobytes()).hexdigest()
+            shape = tuple(cpu_tensor.shape)
+            dtype = str(cpu_tensor.dtype)
+            summaries.append((shape, dtype, checksum))
+        if not summaries:
+            return
+        gathered: list[list[tuple]] = [None] * self.settings.size  # type: ignore[list-item]
+        dist.all_gather_object(gathered, summaries, group = self._cp_group)
+        reference = gathered[0]
+        for idx, summary in enumerate(gathered[1:], start = 1):
+            if summary != reference:
+                raise RuntimeError(
+                    f"Context parallel buffers differ across ranks before sharding (rank {idx} mismatch)."
+                )
 
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
@@ -304,6 +342,7 @@ class ContextParallelManager:
             self._adjust_num_items_in_batch(inputs)
             self._ensure_position_ids(inputs)
             buffers, seq_dims, no_restore = self._collect_buffers(inputs)
+            self._debug_validate_buffers(buffers)
             if not buffers:
                 yield
                 return
