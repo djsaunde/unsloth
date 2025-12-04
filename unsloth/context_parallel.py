@@ -700,6 +700,17 @@ def _patch_sft_trainer(trl_module) -> None:
             _cp_debug(
                 f"[CP-DEBUG] pre-apply input_ids shape={getattr(ids_pre, 'shape', None)} preview={preview_pre}"
             )
+            if os.environ.get("UNSLOTH_CP_DUMP_BATCH") == "1":
+                rank_pre = dist.get_rank() if dist.is_initialized() else 0
+                gathered = inputs.get("input_ids")
+                if isinstance(gathered, torch.Tensor):
+                    tokens = gathered.detach().cpu().flatten().tolist()
+                    chunk = 64
+                    for start in range(0, len(tokens), chunk):
+                        end = min(start + chunk, len(tokens))
+                        _cp_debug(
+                            f"[CP-DEBUG][focus] raw-input_ids rank={rank_pre} idx={start}:{end} tokens={tokens[start:end]}"
+                        )
         context = manager.apply(inputs) if manager else contextlib.nullcontext()
         with context:
             if manager:
