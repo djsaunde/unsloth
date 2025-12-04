@@ -70,12 +70,9 @@ from ..context_parallel import (
 )
 
 
-def _cp_target_layers(config) -> set[int]:
-    layers = {0}
-    total = getattr(config, "num_hidden_layers", None)
-    if isinstance(total, int) and total > 0:
-        layers.add(max(0, total - 1))
-    return layers
+def _cp_target_layers(_: Optional[object] = None) -> set[int]:
+    # Llama 3.2 1B has 16 decoder layers indexed 0..15; track first and last.
+    return {0, 15}
 
 
 def _cp_reconstruct_tensor_for_logging(
@@ -990,7 +987,7 @@ def LlamaAttention_fast_forward(
     cp_active = bool(cp_manager and cp_manager.enabled)
     cp_size = cp_manager.settings.size if cp_manager else 1
     cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
-    focus_layers = _cp_target_layers(self.config)
+    focus_layers = _cp_target_layers()
 
     def _cp_log_tensor(tag: str, tensor: torch.Tensor, seq_dim: int) -> None:
         if not _cp_debug_enabled() or not torch.is_tensor(tensor):
@@ -1312,7 +1309,7 @@ def LlamaDecoderLayer_fast_forward(
         past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
     """
 
-    focus_layers = _cp_target_layers(self.config)
+    focus_layers = _cp_target_layers()
 
     def _cp_log_rms_inputs(stage: str, tensor: torch.Tensor, norm_module) -> None:
         layer_id = getattr(self, "layer_idx", None)
