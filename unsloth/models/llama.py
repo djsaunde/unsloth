@@ -579,6 +579,19 @@ def LlamaAttention_fast_forward(
     cp_size = cp_manager.settings.size if cp_manager else 1
     cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
 
+    if (
+        cp_active
+        and os.environ.get("UNSLOTH_CP_BREAKPOINT")
+        and torch.distributed.is_initialized()
+    ):
+        try:
+            target_rank = int(os.environ["UNSLOTH_CP_BREAKPOINT"])
+        except ValueError:
+            target_rank = 0
+        if torch.distributed.get_rank() == target_rank:
+            torch.distributed.breakpoint()
+        os.environ.pop("UNSLOTH_CP_BREAKPOINT", None)
+
     required_seq_len = kv_seq_len
     if isinstance(position_ids, torch.Tensor) and position_ids.numel() > 0:
         max_position = int(position_ids.max().item()) + 1
