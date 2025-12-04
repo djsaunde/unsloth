@@ -378,6 +378,7 @@ def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
     manager = get_active_context_parallel_manager()
     seq_dim = 1
     ids = input_ids.detach().cpu()
+    flat = ids.flatten().tolist()
     if manager and manager.enabled and manager.process_group is not None:
         gathered = [torch.empty_like(ids) for _ in range(manager.settings.size)]
         dist.all_gather(gathered, ids.to(input_ids.device), group = manager.process_group)
@@ -388,9 +389,7 @@ def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
             f"[CP-DEBUG][focus] full-batch input_ids cp=on tokens={concat.flatten().tolist()}"
         )
     else:
-        _cp_debug(
-            f"[CP-DEBUG][focus] full-batch input_ids cp=off tokens={ids.flatten().tolist()}"
-        )
+        _cp_debug(f"[CP-DEBUG][focus] full-batch input_ids cp=off tokens={flat}")
 
 
 def _reference_rms_norm(layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
