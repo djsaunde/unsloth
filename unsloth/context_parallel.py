@@ -285,21 +285,12 @@ class ContextParallelManager:
         seq_len = input_ids.size(self.settings.seq_dim)
         if seq_len <= 0:
             return
-        attention_mask = inputs.get("attention_mask")
+        device = input_ids.device
         dtype = torch.long
-        if (
-            isinstance(attention_mask, torch.Tensor)
-            and attention_mask.shape == input_ids.shape
-        ):
-            mask = attention_mask.to(dtype = dtype)
-            positions = mask.cumsum(dim = self.settings.seq_dim) - 1
-            positions.masked_fill_(mask == 0, 0)
-        else:
-            device = input_ids.device
-            base = torch.arange(seq_len, dtype = dtype, device = device)
-            view_shape = [1] * input_ids.ndim
-            view_shape[self.settings.seq_dim] = seq_len
-            positions = base.view(view_shape).expand_as(input_ids)
+        base = torch.arange(seq_len, dtype = dtype, device = device)
+        view_shape = [1] * input_ids.ndim
+        view_shape[self.settings.seq_dim] = seq_len
+        positions = base.view(view_shape).expand_as(input_ids)
         positions = positions.to(dtype = torch.long)
         inputs["position_ids"] = positions
         if _cp_debug_enabled():
