@@ -964,6 +964,22 @@ def LlamaDecoderLayer_fast_forward(
             )
 
     use_reference_rms = _cp_should_use_reference_rms(self)
+    focus_logging = (
+        _cp_debug_enabled()
+        and os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() == "focused"
+    )
+    if (
+        use_reference_rms
+        and focus_logging
+        and not getattr(self, "_cp_reference_rms_logged", False)
+    ):
+        setattr(self, "_cp_reference_rms_logged", True)
+        cp_manager = get_active_context_parallel_manager()
+        rank = cp_manager.cp_rank_index if (cp_manager and cp_manager.enabled) else 0
+        size = cp_manager.settings.size if (cp_manager and cp_manager.enabled) else 1
+        _cp_debug(
+            f"[CP-DEBUG][focus] layer=0 using reference RMSNorm fallback rank={rank}/{size}"
+        )
 
     def _apply_rms(norm_module, tensor: torch.Tensor, inference: bool):
         if use_reference_rms:
