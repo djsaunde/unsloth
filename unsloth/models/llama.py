@@ -2169,6 +2169,32 @@ def CausalLM_fast_forward(fast_forward_inference):
 
                 if self.config.model_type == "falcon_h1":
                     hidden_states = hidden_states * self.config.lm_head_multiplier
+                if _cp_debug_enabled() and torch.is_tensor(hidden_states):
+                    manager = get_active_context_parallel_manager()
+                    seq_dim = 1 if hidden_states.ndim > 1 else 0
+                    log_tensor = hidden_states
+                    rank_label = "0/1"
+                    if manager and manager.enabled:
+                        reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
+                            hidden_states,
+                            seq_dim,
+                        )
+                        if attempted:
+                            log_tensor = reconstructed
+                            rank_label = (
+                                f"0/{manager.settings.size}"
+                                if reconstructed is not None
+                                else None
+                            )
+                        else:
+                            rank_label = (
+                                f"{manager.cp_rank_index}/{manager.settings.size}"
+                            )
+                    if log_tensor is not None:
+                        checksum = log_tensor.detach().float().sum().item()
+                        _cp_debug(
+                            f"[CP-DEBUG][logits-hidden] rank={rank_label} shape={tuple(log_tensor.shape)} checksum={checksum:.6f}"
+                        )
 
                 ### DISABLED since T4 breaks
                 # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages` may help.
@@ -2192,6 +2218,10 @@ def CausalLM_fast_forward(fast_forward_inference):
                     torch_compile = True,
                     logit_softcapping = logit_softcapping,
                 )
+                if _cp_debug_enabled() and torch.is_tensor(loss):
+                    _cp_debug(
+                        f"[CP-DEBUG][loss] value={loss.detach().float().item():.6f}"
+                    )
                 if not return_dict:
                     output = (logits,) + outputs[1:]
                     return (loss,) + output if loss is not None else output
