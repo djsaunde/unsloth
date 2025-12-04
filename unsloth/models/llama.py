@@ -990,6 +990,28 @@ def LlamaDecoderLayer_fast_forward(
                 focus = True,
             )
 
+    def _cp_log_rms_output(stage: str, tensor: torch.Tensor) -> None:
+        layer_id = getattr(self, "layer_idx", None)
+        if layer_id != 0:
+            return
+        _cp_log_sequence_tensor(
+            f"rms.{stage}.output.layer={layer_id}",
+            tensor,
+            1,
+            focus = True,
+        )
+
+    def _cp_log_residual(tag: str, tensor: torch.Tensor) -> None:
+        layer_id = getattr(self, "layer_idx", None)
+        if layer_id != 0:
+            return
+        _cp_log_sequence_tensor(
+            f"residual.{tag}.layer={layer_id}",
+            tensor,
+            1,
+            focus = True,
+        )
+
     use_reference_rms = _cp_should_use_reference_rms(self)
     focus_logging = (
         _cp_debug_enabled()
@@ -1010,18 +1032,22 @@ def LlamaDecoderLayer_fast_forward(
             f"[CP-DEBUG][focus] layer=0 using reference RMSNorm fallback rank={rank}/{size}"
         )
 
-    def _apply_rms(norm_module, tensor: torch.Tensor, inference: bool):
+    def _apply_rms(norm_module, tensor: torch.Tensor, inference: bool, stage: str):
         if use_reference_rms:
-            return _reference_rms_norm(norm_module, tensor)
-        if inference:
-            return fast_rms_layernorm_inference(norm_module, tensor)
-        return fast_rms_layernorm(norm_module, tensor)
+            out = _reference_rms_norm(norm_module, tensor)
+        elif inference:
+            out = fast_rms_layernorm_inference(norm_module, tensor)
+        else:
+            out = fast_rms_layernorm(norm_module, tensor)
+        _cp_log_rms_output(stage, out)
+        return out
 
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
+        _cp_log_residual("pre_attn_input", residual)
         _cp_log_layernorm("input.pre", hidden_states)
         _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
-        hidden_states = _apply_rms(self.input_layernorm, hidden_states, True)
+        hidden_states = _apply_rms(self.input_layernorm, hidden_states, True, "input")
         _cp_log_layernorm("input.post", hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
@@ -1034,25 +1060,31 @@ def LlamaDecoderLayer_fast_forward(
             padding_mask = padding_mask,
             position_embeddings = position_embeddings,
         )
+        _cp_log_residual("attn_out", hidden_states)
         hidden_states += residual
+        _cp_log_residual("post_attn_add", hidden_states)
 
         # Fully Connected
         residual = hidden_states
+        _cp_log_residual("pre_mlp_input", residual)
         _cp_log_layernorm("post.pre", hidden_states)
         _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
         hidden_states = _apply_rms(
             self.post_attention_layernorm,
             hidden_states,
             True,
+            "post",
         )
         _cp_log_layernorm("post.post", hidden_states)
         hidden_states = fast_swiglu_inference(self.mlp, hidden_states)
         hidden_states += residual
+        _cp_log_residual("post_mlp_add", hidden_states)
     else:
         residual = hidden_states
+        _cp_log_residual("pre_attn_input", residual)
         _cp_log_layernorm("input.pre", hidden_states)
         _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
-        hidden_states = _apply_rms(self.input_layernorm, hidden_states, False)
+        hidden_states = _apply_rms(self.input_layernorm, hidden_states, False, "input")
         _cp_log_layernorm("input.post", hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
@@ -1065,20 +1097,25 @@ def LlamaDecoderLayer_fast_forward(
             padding_mask = padding_mask,
             position_embeddings = position_embeddings,
         )
+        _cp_log_residual("attn_out", hidden_states)
         hidden_states = residual + hidden_states
+        _cp_log_residual("post_attn_add", hidden_states)
 
         # Fully Connected
         residual = hidden_states
+        _cp_log_residual("pre_mlp_input", residual)
         _cp_log_layernorm("post.pre", hidden_states)
         _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
         hidden_states = _apply_rms(
             self.post_attention_layernorm,
             hidden_states,
             False,
+            "post",
         )
         _cp_log_layernorm("post.post", hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        _cp_log_residual("post_mlp_add", hidden_states)
 
     outputs = (hidden_states,)
     if output_attentions:
