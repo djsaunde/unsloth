@@ -514,36 +514,23 @@ class ContextParallelManager:
                     device = tensor.device if torch.is_tensor(tensor) else None,
                 )
                 return tensor, zeros
-            weight = self._loss_weight(inputs, tensor)
-            if weight is None:
-                if _cp_debug_enabled():
-                    _cp_debug(
-                        f"[CP-DEBUG][focus] _reduce_tensor: weight is None! "
-                        f"Falling back to dividing by CP size ({self.settings.size}). "
-                        f"raw_loss={tensor.item()} cp-rank={self._cp_rank_index}"
-                    )
-                summed = tensor.clone()
-                dist.all_reduce(summed, op = dist.ReduceOp.SUM, group = self._cp_group)
-                total_tokens = torch.tensor(
-                    float(self.settings.size),
-                    dtype = summed.dtype,
-                    device = summed.device,
-                )
-                return summed, total_tokens
+            # Each rank's loss is already the mean over its local tokens.
+            # Sum the means across ranks to get the total loss for the batch.
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] _reduce_tensor: "
-                    f"raw_loss={tensor.item()} local_weight={weight.item()} cp-rank={self._cp_rank_index}"
+                    f"raw_loss={tensor.item()} cp-rank={self._cp_rank_index}"
                 )
-            scaled = tensor * weight
-            dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
-            dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
+            summed = tensor.clone()
+            dist.all_reduce(summed, op = dist.ReduceOp.SUM, group = self._cp_group)
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] _reduce_tensor after all_reduce: "
-                    f"summed_scaled={scaled.item()} total_weight={weight.item()} cp-rank={self._cp_rank_index}"
+                    f"summed={summed.item()} cp-rank={self._cp_rank_index}"
                 )
-            return scaled, weight
+            # Return summed with weight=1 so _finalize just returns summed as-is
+            ones = torch.ones((), dtype = summed.dtype, device = summed.device)
+            return summed, ones
 
         def _finalize(summed, tokens):
             eps = torch.finfo(summed.dtype).eps
