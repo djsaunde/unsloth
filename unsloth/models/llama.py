@@ -62,11 +62,34 @@ from transformers.modeling_attn_mask_utils import (
 )
 from ..kernels import *
 from ..tokenizer_utils import *
+import os
 from ..context_parallel import (
     get_active_context_parallel_manager,
     _cp_debug_enabled,
     _cp_debug,
 )
+
+
+def _cp_reconstruct_tensor_for_logging(
+    tensor: torch.Tensor,
+    seq_dim: int,
+) -> Tuple[Optional[torch.Tensor], bool]:
+    manager = get_active_context_parallel_manager()
+    if (
+        manager is None
+        or not manager.enabled
+        or manager.process_group is None
+        or not dist.is_initialized()
+        or tensor.ndim <= seq_dim
+    ):
+        return None, False
+    local = tensor.detach().contiguous()
+    gathered = [torch.empty_like(local) for _ in range(manager.settings.size)]
+    dist.all_gather(gathered, local, group = manager.process_group)
+    if manager.cp_rank_index != 0:
+        return None, True
+    concat = torch.cat([g.cpu() for g in gathered], dim = seq_dim)
+    return concat, True
 
 
 def _cp_log_sequence_tensor(
@@ -101,25 +124,40 @@ def _cp_log_sequence_tensor(
         seq_dim_resolved = seq_dim % tensor.ndim
         seq_len = tensor.size(seq_dim_resolved)
     if cp_active:
-        if manager.process_group is None:
+        reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
+            tensor,
+            seq_dim_resolved,
+        )
+        if attempted:
+            if reconstructed is None:
+                return
+            shape = tuple(reconstructed.shape)
+            checksum = reconstructed.to(torch.float64).sum().item()
+            seq_len = reconstructed.size(seq_dim_resolved)
+            message = f"{prefix} rank=0/{cp_size} shape={shape} checksum={checksum:.6f}"
+            if seq_len > 0 and seq_len % 2 == 0:
+                half = seq_len // 2
+                first = (
+                    reconstructed.narrow(seq_dim_resolved, 0, half)
+                    .to(torch.float64)
+                    .sum()
+                    .item()
+                )
+                second = (
+                    reconstructed.narrow(seq_dim_resolved, half, half)
+                    .to(torch.float64)
+                    .sum()
+                    .item()
+                )
+                message += f" halves=({first:.6f},{second:.6f})"
+            _cp_debug(message)
+            return
+        if manager and manager.process_group is None:
             message = f"{prefix} rank={cp_rank_index}/{cp_size} shape={shape} checksum={checksum:.6f}"
             _cp_debug(message)
             return
-        checksums = torch.zeros(
-            cp_size,
-            dtype = torch.float32,
-            device = tensor.device,
-        )
-        local = torch.tensor([checksum], dtype = torch.float32, device = tensor.device)
-        gathered = [torch.zeros_like(local) for _ in range(cp_size)]
-        dist.all_gather(gathered, local, group = manager.process_group)
-        values = [g.item() for g in gathered]
-        if cp_rank_index == 0:
-            formatted = ", ".join(f"{v:.6f}" for v in values)
-            message = f"{prefix} rank=0/{cp_size} shape={shape} checksums=[{formatted}]"
-            _cp_debug(message)
-        return
-    message = f"{prefix} rank=0/1 shape={shape} checksum={checksum:.6f}"
+    rank_label = "0/1" if not cp_active else f"{cp_rank_index}/{cp_size}"
+    message = f"{prefix} rank={rank_label} shape={shape} checksum={checksum:.6f}"
     if seq_len > 0 and seq_len % 2 == 0:
         half = seq_len // 2
         first = tensor.narrow(seq_dim_resolved, 0, half).detach().float().sum().item()
@@ -384,9 +422,13 @@ def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
         chunk = 64
         flat = tensor.flatten().tolist()
         total = len(flat)
+        checksum = float(tensor.to(torch.float64).sum().item())
         if total > 512 and os.environ.get("UNSLOTH_CP_DUMP_BATCH_LITERAL") != "1":
             _cp_debug(
                 f"[CP-DEBUG][focus] input_ids {label} len={total} preview={flat[:chunk]}"
+            )
+            _cp_debug(
+                f"[CP-DEBUG][focus] input_ids {label} checksum={checksum} len={total}"
             )
             return
         for start in range(0, total, chunk):
@@ -394,6 +436,9 @@ def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
             _cp_debug(
                 f"[CP-DEBUG][focus] input_ids {label} idx={start}:{end} tokens={flat[start:end]}"
             )
+        _cp_debug(
+            f"[CP-DEBUG][focus] input_ids {label} checksum={checksum} len={total}"
+        )
 
     if manager and manager.enabled and manager.process_group is not None:
         gathered_gpu = [torch.empty_like(ids_gpu) for _ in range(manager.settings.size)]
@@ -947,22 +992,53 @@ def LlamaAttention_fast_forward(
         layer_id = getattr(self, "layer_idx", None)
         if mode == "focused" and layer_id != 0:
             return
-        checksum = tensor.detach().float().sum().item()
-        shape = tuple(tensor.shape)
+        if tensor.ndim == 0:
+            seq_len = 0
+            seq_dim_resolved = 0
+        else:
+            seq_dim_resolved = seq_dim % tensor.ndim
+            seq_len = tensor.size(seq_dim_resolved)
+        log_tensor = tensor
+        rank_label = "0/1"
+        if cp_active:
+            reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
+                tensor,
+                seq_dim_resolved,
+            )
+            if attempted:
+                if reconstructed is None:
+                    return
+                log_tensor = reconstructed
+                rank_label = f"0/{cp_size}"
+            else:
+                rank_label = f"{cp_rank_index}/{cp_size}"
+        checksum = log_tensor.detach().float().sum().item()
+        shape = tuple(log_tensor.shape)
         prefix = "[CP-DEBUG][attn-in]"
         if mode == "focused":
             prefix = "[CP-DEBUG][focus] attn"
-        if cp_active or tensor.size(seq_dim) % 2 != 0:
-            _cp_debug(
-                f"{prefix} rank={cp_rank_index}/{cp_size} layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f}"
-            )
-            return
-        half = tensor.size(seq_dim) // 2
-        first = tensor.narrow(seq_dim, 0, half).detach().float().sum().item()
-        second = tensor.narrow(seq_dim, half, half).detach().float().sum().item()
-        _cp_debug(
-            f"{prefix} rank=0/1 layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f} halves=({first:.6f},{second:.6f})"
+        message = (
+            f"{prefix} rank={rank_label} layer={getattr(self, 'layer_idx', None)} {tag} "
+            f"shape={shape} checksum={checksum:.6f}"
         )
+        if seq_len > 0 and seq_len % 2 == 0:
+            half = seq_len // 2
+            first = (
+                log_tensor.narrow(seq_dim_resolved, 0, half)
+                .detach()
+                .float()
+                .sum()
+                .item()
+            )
+            second = (
+                log_tensor.narrow(seq_dim_resolved, half, half)
+                .detach()
+                .float()
+                .sum()
+                .item()
+            )
+            message += f" halves=({first:.6f},{second:.6f})"
+        _cp_debug(message)
 
     _cp_log_tensor("hidden_states", hidden_states, 1)
     Q, K, V = self.apply_qkv(self, hidden_states)
@@ -1145,30 +1221,53 @@ def LlamaAttention_fast_forward(
             prefix = "[CP-DEBUG][attn-out]"
             if mode == "focused":
                 prefix = "[CP-DEBUG][focus] attn"
-            if cp_active:
-                checksum = (
-                    A.detach().float().sum().item()
-                    if torch.is_tensor(A)
-                    else float("nan")
-                )
-                _cp_debug(
-                    f"{prefix} rank={cp_rank_index}/{cp_size} layer={layer_id} checksum={checksum:.6f}"
-                )
-            else:
-                checksum_full = (
-                    A.detach().float().sum().item()
-                    if torch.is_tensor(A)
-                    else float("nan")
-                )
-                message = (
-                    f"{prefix} rank=0/1 layer={layer_id} checksum={checksum_full:.6f}"
-                )
-                if torch.is_tensor(A) and A.shape[1] % 2 == 0:
-                    half = A.shape[1] // 2
-                    first = A[:, :half].detach().float().sum().item()
-                    second = A[:, half:].detach().float().sum().item()
-                    message += f" halves=({first:.6f},{second:.6f})"
-                _cp_debug(message)
+            if torch.is_tensor(A):
+                if A.ndim == 0:
+                    seq_dim_resolved = 0
+                else:
+                    seq_dim_resolved = 1 % A.ndim
+                log_tensor = A
+                rank_label = "0/1"
+                should_log = True
+                if cp_active:
+                    reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
+                        A,
+                        seq_dim_resolved,
+                    )
+                    if attempted:
+                        if reconstructed is None:
+                            should_log = False
+                        else:
+                            log_tensor = reconstructed
+                            rank_label = f"0/{cp_size}"
+                    else:
+                        rank_label = f"{cp_rank_index}/{cp_size}"
+                if should_log:
+                    seq_len = (
+                        log_tensor.size(seq_dim_resolved)
+                        if log_tensor.ndim > seq_dim_resolved
+                        else 0
+                    )
+                    checksum = log_tensor.detach().float().sum().item()
+                    message = f"{prefix} rank={rank_label} layer={layer_id} checksum={checksum:.6f}"
+                    if seq_len > 0 and seq_len % 2 == 0:
+                        half = seq_len // 2
+                        first = (
+                            log_tensor.narrow(seq_dim_resolved, 0, half)
+                            .detach()
+                            .float()
+                            .sum()
+                            .item()
+                        )
+                        second = (
+                            log_tensor.narrow(seq_dim_resolved, half, half)
+                            .detach()
+                            .float()
+                            .sum()
+                            .item()
+                        )
+                        message += f" halves=({first:.6f},{second:.6f})"
+                    _cp_debug(message)
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
     attn_output = self.apply_o(self, attn_output)
     attn_weights = None
