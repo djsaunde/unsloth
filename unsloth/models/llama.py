@@ -1443,6 +1443,36 @@ def LlamaModel_fast_forward(
         and os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() == "focused"
     ):
         manager = get_active_context_parallel_manager()
+        # Optional: override inputs with baseline for reproducibility
+        enforced = False
+        if os.environ.get("UNSLOTH_CP_ENFORCE_BASELINE", "0") == "1":
+            if manager and manager.enabled:
+                baseline_ids = None
+                baseline_embeds = _cp_load_baseline_inputs(inputs_embeds.device)
+                if isinstance(input_ids, torch.Tensor):
+                    baseline_ids = _cp_load_baseline_ids(input_ids.device)
+                if baseline_ids is not None and isinstance(input_ids, torch.Tensor):
+                    seq_dim = 1
+                    local_len = input_ids.size(seq_dim)
+                    start = manager.cp_rank_index * local_len
+                    input_ids = baseline_ids.narrow(seq_dim, start, local_len).to(
+                        device = input_ids.device
+                    )
+                    enforced = True
+                if baseline_embeds is not None:
+                    seq_dim = 1
+                    local_len = inputs_embeds.size(seq_dim)
+                    start = manager.cp_rank_index * local_len
+                    inputs_embeds = baseline_embeds.narrow(
+                        seq_dim, start, local_len
+                    ).to(device = inputs_embeds.device, dtype = inputs_embeds.dtype)
+                    enforced = True
+                if enforced:
+                    _cp_debug(
+                        f"[CP-DEBUG][focus] enforced baseline rank={manager.cp_rank_index}/{manager.settings.size}"
+                    )
+        # After potential enforcement, log/save baselines
+        manager = get_active_context_parallel_manager()
         if manager and manager.enabled:
             _cp_compare_inputs_with_baseline(inputs_embeds)
             if input_ids is not None:
