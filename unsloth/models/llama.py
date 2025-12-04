@@ -631,10 +631,6 @@ def LlamaAttention_fast_forward(
         return cos_slice, sin_slice
 
     cos, sin = _slice_rope_frequencies(cos, sin)
-    if _cp_debug_enabled() and cp_active:
-        _cp_debug(
-            f"[CP-DEBUG][attn] rank={cp_rank_index}/{cp_size} q_len={q_len} kv_seq_len={kv_seq_len} required_seq_len={required_seq_len}"
-        )
     Q, K = fast_rope_embedding(Q, K, cos, sin)
 
     if past_key_value is not None:
@@ -727,6 +723,14 @@ def LlamaAttention_fast_forward(
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2).contiguous()
         pass
+    if _cp_debug_enabled():
+        layer_id = getattr(self, "layer_idx", None)
+        checksum = (
+            A.detach().float().sum().item() if torch.is_tensor(A) else float("nan")
+        )
+        _cp_debug(
+            f"[CP-DEBUG][attn-out] rank={cp_rank_index}/{cp_size} layer={layer_id} checksum={checksum:.6f}"
+        )
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
     attn_output = self.apply_o(self, attn_output)
     attn_weights = None
