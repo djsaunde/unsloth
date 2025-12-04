@@ -358,10 +358,16 @@ def _cp_compare_ids_with_baseline(tensor: torch.Tensor) -> None:
         return
     start = manager.cp_rank_index * local_len
     reference = baseline.narrow(seq_dim, start, local_len)
-    mismatch = (tensor.detach() != reference.to(device = tensor.device)).any().item()
-    _cp_debug(
-        f"[CP-DEBUG][focus] ids-baseline rank={manager.cp_rank_index}/{manager.settings.size} match={not mismatch}"
-    )
+    diff_mask = tensor.detach() != reference.to(device = tensor.device)
+    mismatch = diff_mask.any().item()
+    message = f"[CP-DEBUG][focus] ids-baseline rank={manager.cp_rank_index}/{manager.settings.size} match={not mismatch}"
+    if mismatch:
+        idx = diff_mask.flatten().nonzero(as_tuple = False)
+        preview_idx = idx[:5].view(-1).tolist()
+        local_vals = tensor.flatten()[idx[:5]].tolist()
+        ref_vals = reference.flatten()[idx[:5]].tolist()
+        message += f" first_diff_indices={preview_idx} local_vals={local_vals} ref_vals={ref_vals}"
+    _cp_debug(message)
 
 
 def _reference_rms_norm(layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
