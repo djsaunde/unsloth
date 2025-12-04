@@ -647,25 +647,6 @@ def LlamaAttention_fast_forward(
     )
     use_flash = (not cp_active) and HAS_FLASH_ATTENTION and attention_mask is None
 
-    if _cp_debug_enabled():
-        backend = "sdpa"
-        reason = (
-            "forced by context parallel"
-            if cp_active
-            else "mask or backend requirements"
-        )
-        if use_xformers:
-            backend = "xformers"
-            reason = ""
-        elif use_flash:
-            backend = "flash_attention"
-            reason = ""
-        print(
-            f"[CP-DEBUG] attention backend={backend} (cp_active={cp_active}, HAS_FLASH={HAS_FLASH_ATTENTION}, HAS_XFORMERS={HAS_XFORMERS}, "
-            f"attn_mask={'present' if attention_mask is not None else 'none'}) {reason}",
-            flush = True,
-        )
-
     if use_xformers:
         # Xformers memory efficient attention
         # Also has Flash Attention v2 dispatching
