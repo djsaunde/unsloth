@@ -188,6 +188,98 @@ def _cp_log_embed_consistency(
         _cp_debug(f"[CP-DEBUG][focus] embed-baseline chunks=[{chunks}]")
 
 
+_CP_BASELINE_INPUTS_CACHE: Optional[torch.Tensor] = None
+
+
+def _cp_baseline_path() -> Optional[str]:
+    return os.environ.get("UNSLOTH_CP_BASELINE_PATH")
+
+
+def _cp_maybe_save_inputs_baseline(tensor: torch.Tensor) -> None:
+    path = _cp_baseline_path()
+    if path is None:
+        return
+    manager = get_active_context_parallel_manager()
+    if manager and manager.enabled:
+        return
+    target_path = (
+        os.path.join(path, "unsloth_cp_inputs_baseline.pt")
+        if os.path.isdir(path)
+        else path
+    )
+    if (
+        os.path.exists(target_path)
+        and os.environ.get("UNSLOTH_CP_OVERWRITE_BASELINE") != "1"
+    ):
+        return
+    data = tensor.detach().cpu()
+    torch.save(
+        {
+            "tensor": data,
+            "shape": tuple(data.shape),
+            "dtype": str(data.dtype),
+        },
+        target_path,
+    )
+    if _cp_debug_enabled():
+        _cp_debug(
+            f"[CP-DEBUG][focus] saved baseline inputs to {target_path} shape={tuple(data.shape)}"
+        )
+
+
+def _cp_load_baseline_inputs(device: torch.device) -> Optional[torch.Tensor]:
+    global _CP_BASELINE_INPUTS_CACHE
+    if _CP_BASELINE_INPUTS_CACHE is not None:
+        return _CP_BASELINE_INPUTS_CACHE.to(device = device)
+    path = _cp_baseline_path()
+    if path is None:
+        return None
+    target_path = (
+        os.path.join(path, "unsloth_cp_inputs_baseline.pt")
+        if os.path.isdir(path)
+        else path
+    )
+    if not os.path.exists(target_path):
+        return None
+    payload = torch.load(target_path, map_location = device)
+    tensor = payload.get("tensor")
+    if not torch.is_tensor(tensor):
+        return None
+    _CP_BASELINE_INPUTS_CACHE = tensor
+    return tensor.to(device = device)
+
+
+def _cp_compare_inputs_with_baseline(tensor: torch.Tensor) -> None:
+    path = _cp_baseline_path()
+    if path is None:
+        return
+    manager = get_active_context_parallel_manager()
+    if not (manager and manager.enabled):
+        return
+    baseline = _cp_load_baseline_inputs(tensor.device)
+    if baseline is None:
+        return
+    seq_dim = 1
+    local_len = tensor.size(seq_dim)
+    total_len = baseline.size(seq_dim)
+    expected_total = local_len * manager.settings.size
+    if expected_total > total_len:
+        if _cp_debug_enabled() and manager.cp_rank_index == 0:
+            _cp_debug(
+                "[CP-DEBUG][focus] baseline length mismatch; skipping comparison."
+            )
+        return
+    start = manager.cp_rank_index * local_len
+    reference = baseline.narrow(seq_dim, start, local_len)
+    diff = tensor.detach() - reference.to(device = tensor.device, dtype = tensor.dtype)
+    max_abs = diff.abs().max().item()
+    local_sum = tensor.detach().float().sum().item()
+    ref_sum = reference.detach().float().sum().item()
+    _cp_debug(
+        f"[CP-DEBUG][focus] inputs-baseline rank={manager.cp_rank_index}/{manager.settings.size} max_abs={max_abs:.6f} local_sum={local_sum:.6f} ref_sum={ref_sum:.6f}"
+    )
+
+
 def _reference_rms_norm(layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
     eps = getattr(layernorm, "variance_epsilon", getattr(layernorm, "eps", 1e-6))
     variance = hidden_states.to(torch.float32)
@@ -1256,6 +1348,15 @@ def LlamaModel_fast_forward(
         inputs_embeds = self.embed_tokens(input_ids)
     _cp_log_sequence_tensor("embed", inputs_embeds, 1)
     _cp_log_embed_consistency(self, input_ids, inputs_embeds)
+    if (
+        _cp_debug_enabled()
+        and os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() == "focused"
+    ):
+        manager = get_active_context_parallel_manager()
+        if manager and manager.enabled:
+            _cp_compare_inputs_with_baseline(inputs_embeds)
+        else:
+            _cp_maybe_save_inputs_baseline(inputs_embeds)
 
     inputs_embeds = inputs_embeds.to(_get_dtype(dtype_from_config(self.config)))
 
