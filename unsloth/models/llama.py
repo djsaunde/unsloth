@@ -370,6 +370,29 @@ def _cp_compare_ids_with_baseline(tensor: torch.Tensor) -> None:
     _cp_debug(message)
 
 
+def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
+    if os.environ.get("UNSLOTH_CP_DUMP_BATCH") != "1":
+        return
+    if not (_cp_debug_enabled() and isinstance(input_ids, torch.Tensor)):
+        return
+    manager = get_active_context_parallel_manager()
+    seq_dim = 1
+    ids = input_ids.detach().cpu()
+    if manager and manager.enabled and manager.process_group is not None:
+        gathered = [torch.empty_like(ids) for _ in range(manager.settings.size)]
+        dist.all_gather(gathered, ids.to(input_ids.device), group = manager.process_group)
+        if manager.cp_rank_index != 0:
+            return
+        concat = torch.cat([g.cpu() for g in gathered], dim = seq_dim)
+        _cp_debug(
+            f"[CP-DEBUG][focus] full-batch input_ids cp=on tokens={concat.flatten().tolist()}"
+        )
+    else:
+        _cp_debug(
+            f"[CP-DEBUG][focus] full-batch input_ids cp=off tokens={ids.flatten().tolist()}"
+        )
+
+
 def _reference_rms_norm(layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
     eps = getattr(layernorm, "variance_epsilon", getattr(layernorm, "eps", 1e-6))
     variance = hidden_states.to(torch.float32)
@@ -1477,10 +1500,12 @@ def LlamaModel_fast_forward(
             _cp_compare_inputs_with_baseline(inputs_embeds)
             if input_ids is not None:
                 _cp_compare_ids_with_baseline(input_ids)
+                _cp_dump_input_batch(input_ids)
         else:
             _cp_maybe_save_inputs_baseline(inputs_embeds)
             if input_ids is not None:
                 _cp_maybe_save_ids_baseline(input_ids)
+                _cp_dump_input_batch(input_ids)
 
     inputs_embeds = inputs_embeds.to(_get_dtype(dtype_from_config(self.config)))
 
