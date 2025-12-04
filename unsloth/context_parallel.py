@@ -413,7 +413,7 @@ class ContextParallelManager:
         if not isinstance(reference, torch.Tensor):
             if _cp_debug_enabled():
                 _cp_debug(
-                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: reference is not tensor"
+                    f"[CP-DEBUG][focus] _loss_weight: reference is not tensor cp-rank={self._cp_rank_index}"
                 )
             return None
         labels = self._rank_slice(inputs.get("labels"))
@@ -421,8 +421,8 @@ class ContextParallelManager:
             weight = labels.ne(-100).sum()
             if _cp_debug_enabled():
                 _cp_debug(
-                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: labels shape={labels.shape} "
-                    f"valid_tokens={weight.item()}"
+                    f"[CP-DEBUG][focus] _loss_weight: labels shape={labels.shape} "
+                    f"valid_tokens={weight.item()} cp-rank={self._cp_rank_index}"
                 )
             if weight.item() > 0:
                 return weight.to(device = reference.device, dtype = reference.dtype)
@@ -431,14 +431,14 @@ class ContextParallelManager:
             weight = attention_mask.sum()
             if _cp_debug_enabled():
                 _cp_debug(
-                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: attention_mask shape={attention_mask.shape} "
-                    f"sum={weight.item()}"
+                    f"[CP-DEBUG][focus] _loss_weight: attention_mask shape={attention_mask.shape} "
+                    f"sum={weight.item()} cp-rank={self._cp_rank_index}"
                 )
             if weight.item() > 0:
                 return weight.to(device = reference.device, dtype = reference.dtype)
         if _cp_debug_enabled():
             _cp_debug(
-                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: returning None (no valid weight found)"
+                f"[CP-DEBUG][focus] _loss_weight: returning None (no valid weight found) cp-rank={self._cp_rank_index}"
             )
         return None
 
@@ -518,9 +518,9 @@ class ContextParallelManager:
             if weight is None:
                 if _cp_debug_enabled():
                     _cp_debug(
-                        f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _reduce_tensor: weight is None! "
+                        f"[CP-DEBUG][focus] _reduce_tensor: weight is None! "
                         f"Falling back to dividing by CP size ({self.settings.size}). "
-                        f"raw_loss={tensor.item()}"
+                        f"raw_loss={tensor.item()} cp-rank={self._cp_rank_index}"
                     )
                 summed = tensor.clone()
                 dist.all_reduce(summed, op = dist.ReduceOp.SUM, group = self._cp_group)
@@ -532,16 +532,16 @@ class ContextParallelManager:
                 return summed, total_tokens
             if _cp_debug_enabled():
                 _cp_debug(
-                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _reduce_tensor: "
-                    f"raw_loss={tensor.item()} local_weight={weight.item()}"
+                    f"[CP-DEBUG][focus] _reduce_tensor: "
+                    f"raw_loss={tensor.item()} local_weight={weight.item()} cp-rank={self._cp_rank_index}"
                 )
             scaled = tensor * weight
             dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
             dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
             if _cp_debug_enabled():
                 _cp_debug(
-                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _reduce_tensor after all_reduce: "
-                    f"summed_scaled={scaled.item()} total_weight={weight.item()}"
+                    f"[CP-DEBUG][focus] _reduce_tensor after all_reduce: "
+                    f"summed_scaled={scaled.item()} total_weight={weight.item()} cp-rank={self._cp_rank_index}"
                 )
             return scaled, weight
 
@@ -552,7 +552,8 @@ class ContextParallelManager:
             self._set_report_tokens(tokens)
             if _cp_debug_enabled():
                 _cp_debug(
-                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] reduce_loss summed={summed} tokens={tokens} normalized={normalized}"
+                    f"[CP-DEBUG][focus] reduce_loss _finalize: summed={summed.item()} tokens={tokens.item()} "
+                    f"normalized={normalized.item()} cp-rank={self._cp_rank_index}"
                 )
             return normalized
 
