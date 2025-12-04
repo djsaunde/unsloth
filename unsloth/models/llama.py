@@ -377,26 +377,33 @@ def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
         return
     manager = get_active_context_parallel_manager()
     seq_dim = 1
-    ids = input_ids.detach().cpu()
+    ids_gpu = input_ids.detach()
+    ids_cpu = ids_gpu.cpu()
 
-    def _emit(label: str, tokens: list[int]) -> None:
+    def _emit(label: str, tensor: torch.Tensor) -> None:
         chunk = 64
-        total = len(tokens)
+        flat = tensor.flatten().tolist()
+        total = len(flat)
+        if total > 512 and os.environ.get("UNSLOTH_CP_DUMP_BATCH_LITERAL") != "1":
+            _cp_debug(
+                f"[CP-DEBUG][focus] input_ids {label} len={total} preview={flat[:chunk]}"
+            )
+            return
         for start in range(0, total, chunk):
             end = min(start + chunk, total)
             _cp_debug(
-                f"[CP-DEBUG][focus] input_ids {label} idx={start}:{end} tokens={tokens[start:end]}"
+                f"[CP-DEBUG][focus] input_ids {label} idx={start}:{end} tokens={flat[start:end]}"
             )
 
     if manager and manager.enabled and manager.process_group is not None:
-        gathered = [torch.empty_like(ids) for _ in range(manager.settings.size)]
-        dist.all_gather(gathered, ids.to(input_ids.device), group = manager.process_group)
+        gathered_gpu = [torch.empty_like(ids_gpu) for _ in range(manager.settings.size)]
+        dist.all_gather(gathered_gpu, ids_gpu, group = manager.process_group)
         if manager.cp_rank_index != 0:
             return
-        concat = torch.cat([g.cpu() for g in gathered], dim = seq_dim)
-        _emit("cp=on", concat.flatten().tolist())
+        concat = torch.cat([g.cpu() for g in gathered_gpu], dim = seq_dim)
+        _emit("cp=on", concat)
     else:
-        _emit("cp=off", ids.flatten().tolist())
+        _emit("cp=off", ids_cpu)
 
 
 def _reference_rms_norm(layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
