@@ -162,6 +162,7 @@ class ContextParallelManager:
         self._report_loss: Optional[torch.Tensor] = None
         self._report_tokens: Optional[torch.Tensor] = None
         self._last_global_seq_len: Optional[int] = None
+        self._debug_raw_input_ids: Optional[torch.Tensor] = None
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
@@ -366,6 +367,17 @@ class ContextParallelManager:
         finally:
             if token is not None:
                 _ACTIVE_MANAGER.reset(token)
+
+    def remember_raw_input_ids(self, tensor: Optional[torch.Tensor]) -> None:
+        if tensor is None or not torch.is_tensor(tensor):
+            self._debug_raw_input_ids = None
+            return
+        self._debug_raw_input_ids = tensor.detach().to("cpu").contiguous()
+
+    def consume_raw_input_ids(self) -> Optional[torch.Tensor]:
+        raw = self._debug_raw_input_ids
+        self._debug_raw_input_ids = None
+        return raw
 
     @contextlib.contextmanager
     def replay_context(self):
@@ -690,6 +702,12 @@ def _patch_sft_trainer(trl_module) -> None:
     @functools.wraps(original_compute_loss)
     def patched_compute_loss(self, model, inputs, return_outputs = False, **kwargs):
         manager = getattr(self, "_context_parallel_manager", None)
+        if (
+            manager
+            and os.environ.get("UNSLOTH_CP_DUMP_BATCH") == "1"
+            and isinstance(inputs.get("input_ids"), torch.Tensor)
+        ):
+            manager.remember_raw_input_ids(inputs["input_ids"])
         if _cp_debug_enabled():
             ids_pre = inputs.get("input_ids")
             preview_pre = (

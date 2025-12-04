@@ -402,6 +402,9 @@ def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
             return
         concat = torch.cat([g.cpu() for g in gathered_gpu], dim = seq_dim)
         _emit("cp=on", concat)
+        raw = manager.consume_raw_input_ids()
+        if isinstance(raw, torch.Tensor):
+            _emit("cp=reordered", raw)
     else:
         _emit("cp=off", ids_cpu)
 
