@@ -75,6 +75,10 @@ def _cp_target_layers(_: Optional[object] = None) -> set[int]:
     return {0, 15}
 
 
+def _cp_log_layernorm(*args, **kwargs) -> None:
+    return
+
+
 def _cp_reconstruct_tensor_for_logging(
     tensor: torch.Tensor,
     seq_dim: int,
