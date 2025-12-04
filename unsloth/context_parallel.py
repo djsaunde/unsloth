@@ -19,9 +19,7 @@ try:
     from torch.distributed.tensor import DeviceMesh
 
     # Disable load balancing in context parallel to debug divergence
-    from torch.distributed.tensor.experimental._context_parallel._attention import (
-        _cp_options,
-    )
+    from torch.distributed.tensor.experimental._attention import _cp_options
 
     _cp_options.enable_load_balance = False
 except (ImportError, AttributeError):  # pragma: no cover - handled at runtime
