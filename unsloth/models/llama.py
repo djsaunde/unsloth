@@ -565,6 +565,11 @@ def LlamaAttention_fast_forward(
     head_dim = self.head_dim
     assert n_kv_heads * n_groups == n_heads
 
+    cp_manager = get_active_context_parallel_manager()
+    cp_active = bool(cp_manager and cp_manager.enabled)
+    cp_size = cp_manager.settings.size if cp_manager else 1
+    cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
+
     def _cp_log_tensor(tag: str, tensor: torch.Tensor, seq_dim: int) -> None:
         if not _cp_debug_enabled() or not torch.is_tensor(tensor):
             return
@@ -591,11 +596,6 @@ def LlamaAttention_fast_forward(
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
-
-    cp_manager = get_active_context_parallel_manager()
-    cp_active = bool(cp_manager and cp_manager.enabled)
-    cp_size = cp_manager.settings.size if cp_manager else 1
-    cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
 
     if (
         cp_active
