@@ -725,12 +725,24 @@ def LlamaAttention_fast_forward(
         pass
     if _cp_debug_enabled():
         layer_id = getattr(self, "layer_idx", None)
-        checksum = (
-            A.detach().float().sum().item() if torch.is_tensor(A) else float("nan")
-        )
-        _cp_debug(
-            f"[CP-DEBUG][attn-out] rank={cp_rank_index}/{cp_size} layer={layer_id} checksum={checksum:.6f}"
-        )
+        if cp_active:
+            checksum = (
+                A.detach().float().sum().item() if torch.is_tensor(A) else float("nan")
+            )
+            _cp_debug(
+                f"[CP-DEBUG][attn-out] rank={cp_rank_index}/{cp_size} layer={layer_id} checksum={checksum:.6f}"
+            )
+        else:
+            checksum_full = (
+                A.detach().float().sum().item() if torch.is_tensor(A) else float("nan")
+            )
+            message = f"[CP-DEBUG][attn-out] rank=0/1 layer={layer_id} checksum={checksum_full:.6f}"
+            if torch.is_tensor(A) and A.shape[1] % 2 == 0:
+                half = A.shape[1] // 2
+                first = A[:, :half].detach().float().sum().item()
+                second = A[:, half:].detach().float().sum().item()
+                message += f" halves=({first:.6f},{second:.6f})"
+            _cp_debug(message)
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
     attn_output = self.apply_o(self, attn_output)
     attn_weights = None
