@@ -2208,12 +2208,28 @@ def CausalLM_fast_forward(fast_forward_inference):
             logits = self.lm_head(hidden_states.to(dtype))
 
         logits = logits.to(_get_dtype(dtype_from_config(self.config)))
-        if _cp_debug_enabled():
-            cp_manager = get_active_context_parallel_manager()
-            if cp_manager and cp_manager.enabled and torch.is_tensor(logits):
-                checksum = logits.detach().float().sum().item()
+        if _cp_debug_enabled() and torch.is_tensor(logits):
+            manager = get_active_context_parallel_manager()
+            seq_dim = 1 if logits.ndim > 1 else 0
+            log_tensor = logits
+            rank_label = "0/1"
+            if manager and manager.enabled:
+                reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
+                    logits,
+                    seq_dim,
+                )
+                if attempted:
+                    if reconstructed is None:
+                        log_tensor = None
+                    else:
+                        log_tensor = reconstructed
+                        rank_label = f"0/{manager.settings.size}"
+                else:
+                    rank_label = f"{manager.cp_rank_index}/{manager.settings.size}"
+            if log_tensor is not None:
+                checksum = log_tensor.detach().float().sum().item()
                 _cp_debug(
-                    f"[CP-DEBUG][logits] rank={cp_manager.cp_rank_index} shape={tuple(logits.shape)} checksum={checksum:.4f}"
+                    f"[CP-DEBUG][logits] rank={rank_label} shape={tuple(log_tensor.shape)} checksum={checksum:.6f}"
                 )
         loss = None
         logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
@@ -2240,6 +2256,39 @@ def CausalLM_fast_forward(fast_forward_inference):
             n_items = kwargs.get("num_items_in_batch", None)
             if n_items is None:
                 n_items = kwargs.get("n_items", None)
+            if _cp_debug_enabled() and torch.is_tensor(shift_logits):
+                manager = get_active_context_parallel_manager()
+                seq_dim = 1 if shift_logits.ndim > 1 else 0
+                log_tensor = shift_logits
+                rank_label = "0/1"
+                if manager and manager.enabled:
+                    reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
+                        shift_logits,
+                        seq_dim,
+                    )
+                    if attempted:
+                        if reconstructed is not None:
+                            log_tensor = reconstructed
+                            rank_label = f"0/{manager.settings.size}"
+                        else:
+                            log_tensor = None
+                    else:
+                        rank_label = f"{manager.cp_rank_index}/{manager.settings.size}"
+                if log_tensor is not None:
+                    checksum = log_tensor.detach().float().sum().item()
+                    _cp_debug(
+                        f"[CP-DEBUG][loss-input logits] rank={rank_label} checksum={checksum:.6f}"
+                    )
+            if _cp_debug_enabled() and torch.is_tensor(shift_labels):
+                valid = shift_labels.ne(-100)
+                label_sum = (
+                    shift_labels.masked_select(valid).sum().item()
+                    if valid.any()
+                    else 0.0
+                )
+                _cp_debug(
+                    f"[CP-DEBUG][loss-input labels] valid_tokens={valid.sum().item()} checksum={label_sum:.6f}"
+                )
             loss = fast_cross_entropy_loss(
                 logits = shift_logits,
                 labels = shift_labels,
@@ -2247,6 +2296,8 @@ def CausalLM_fast_forward(fast_forward_inference):
                 logit_scaling = logit_scaling,
                 n_items = n_items,
             )
+            if _cp_debug_enabled() and torch.is_tensor(loss):
+                _cp_debug(f"[CP-DEBUG][loss] value={loss.detach().float().item():.6f}")
         else:
             if logit_scaling != 0:
                 if logits.requires_grad:
