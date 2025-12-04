@@ -914,6 +914,13 @@ def LlamaModel_fast_forward(
     if position_ids is not None:
         if position_ids.shape[0] != batch_size:
             position_ids = position_ids.repeat((batch_size, 1))
+        manager = get_active_context_parallel_manager()
+        if manager and manager.enabled and manager.last_global_seq_len is not None:
+            chunk = manager.last_global_seq_len // manager.settings.size
+            expected_start = manager.cp_rank_index * chunk
+            actual_min = int(position_ids.min().item())
+            if actual_min < expected_start:
+                position_ids = position_ids + (expected_start - actual_min)
         if _cp_debug_enabled():
             preview = position_ids[0][: min(16, position_ids.shape[-1])].tolist()
             _cp_debug(

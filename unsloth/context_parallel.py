@@ -161,6 +161,7 @@ class ContextParallelManager:
         self._cached_num_items: Optional[torch.Tensor | float | int] = None
         self._report_loss: Optional[torch.Tensor] = None
         self._report_tokens: Optional[torch.Tensor] = None
+        self._last_global_seq_len: Optional[int] = None
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
@@ -244,6 +245,10 @@ class ContextParallelManager:
     def cp_rank_index(self) -> int:
         return self._cp_rank_index
 
+    @property
+    def last_global_seq_len(self) -> Optional[int]:
+        return self._last_global_seq_len
+
     def data_parallel_rank(self) -> int:
         if (
             not torch.distributed.is_available()
@@ -285,6 +290,7 @@ class ContextParallelManager:
         seq_len = input_ids.size(self.settings.seq_dim)
         if seq_len <= 0:
             return
+        self._last_global_seq_len = seq_len
         device = input_ids.device
         dtype = torch.long
         base = torch.arange(seq_len, dtype = dtype, device = device)
