@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.distributed as dist
 import gc
 import math
 import functools
@@ -102,6 +103,59 @@ def _cp_log_sequence_tensor(
         )
         message += f" halves=({first:.6f},{second:.6f})"
     _cp_debug(message)
+
+
+def _cp_log_embed_consistency(
+    model,
+    input_ids: Optional[torch.Tensor],
+    inputs_embeds: Optional[torch.Tensor],
+) -> None:
+    if not _cp_debug_enabled():
+        return
+    if input_ids is None or inputs_embeds is None:
+        return
+    cp_manager = get_active_context_parallel_manager()
+    if not (cp_manager and cp_manager.enabled):
+        return
+    group = cp_manager.process_group
+    if group is None or cp_manager.settings.size <= 1:
+        return
+    if not dist.is_initialized():
+        return
+    seq_dim = 1
+    if input_ids.ndim <= seq_dim or inputs_embeds.ndim <= seq_dim:
+        return
+    local_seq = input_ids.size(seq_dim)
+    if local_seq == 0:
+        return
+    cp_size = cp_manager.settings.size
+    gather_shape = [
+        torch.empty_like(input_ids, device = input_ids.device) for _ in range(cp_size)
+    ]
+    dist.all_gather(gather_shape, input_ids, group = group)
+    baseline = torch.zeros(
+        cp_size,
+        dtype = torch.float32,
+        device = inputs_embeds.device,
+    )
+    if cp_manager.cp_rank_index == 0:
+        with torch.no_grad():
+            full_ids = torch.cat(gather_shape, dim = seq_dim)
+            full_embeds = model.embed_tokens(full_ids)
+            for idx in range(cp_size):
+                start = idx * local_seq
+                chunk = full_embeds.narrow(seq_dim, start, local_seq)
+                baseline[idx] = chunk.detach().float().sum()
+    dist.broadcast(baseline, src = 0, group = group)
+    expected = baseline[cp_manager.cp_rank_index].item()
+    local_sum = inputs_embeds.detach().float().sum().item()
+    diff = local_sum - expected
+    _cp_debug(
+        f"[CP-DEBUG][focus] embed-chunk rank={cp_manager.cp_rank_index}/{cp_size} local={local_sum:.6f} expected={expected:.6f} diff={diff:+.6f}"
+    )
+    if cp_manager.cp_rank_index == 0:
+        chunks = ", ".join(f"{value:.6f}" for value in baseline.tolist())
+        _cp_debug(f"[CP-DEBUG][focus] embed-baseline chunks=[{chunks}]")
 
 
 if HAS_FLASH_ATTENTION:
@@ -1033,6 +1087,7 @@ def LlamaModel_fast_forward(
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
     _cp_log_sequence_tensor("embed", inputs_embeds, 1)
+    _cp_log_embed_consistency(self, input_ids, inputs_embeds)
 
     inputs_embeds = inputs_embeds.to(_get_dtype(dtype_from_config(self.config)))
 

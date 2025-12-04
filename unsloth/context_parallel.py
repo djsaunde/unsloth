@@ -246,6 +246,10 @@ class ContextParallelManager:
         return self._cp_rank_index
 
     @property
+    def process_group(self) -> Optional[dist.ProcessGroup]:
+        return self._cp_group
+
+    @property
     def last_global_seq_len(self) -> Optional[int]:
         return self._last_global_seq_len
 
@@ -820,5 +824,9 @@ def _cp_debug_enabled() -> bool:
 
 
 def _cp_debug(msg: str) -> None:
-    if _cp_debug_enabled():
-        print(msg, flush = True)
+    if not _cp_debug_enabled():
+        return
+    mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "focused").lower()
+    if mode == "focused" and "[CP-DEBUG][focus]" not in msg:
+        return
+    print(msg, flush = True)
