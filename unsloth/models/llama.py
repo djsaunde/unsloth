@@ -145,9 +145,12 @@ def _cp_log_embed_consistency(
         with torch.no_grad():
             full_ids = torch.cat(gather_shape, dim = seq_dim)
             full_embeds = model.embed_tokens(full_ids)
-            for idx in range(cp_size):
-                start = idx * local_seq
-                chunk = full_embeds.narrow(seq_dim, start, local_seq)
+            chunks = torch.chunk(full_embeds, cp_size, dim = seq_dim)
+            if len(chunks) != cp_size:
+                raise RuntimeError(
+                    f"Context parallel chunking failed: expected {cp_size} segments, got {len(chunks)}."
+                )
+            for idx, chunk in enumerate(chunks):
                 baseline[idx] = chunk.detach().float().sum()
     dist.broadcast(baseline, src = 0, group = group)
     expected = baseline[cp_manager.cp_rank_index].item()
