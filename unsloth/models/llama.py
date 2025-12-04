@@ -64,6 +64,7 @@ from ..tokenizer_utils import *
 from ..context_parallel import (
     get_active_context_parallel_manager,
     _cp_debug_enabled,
+    _cp_debug,
 )
 
 if HAS_FLASH_ATTENTION:
@@ -630,6 +631,10 @@ def LlamaAttention_fast_forward(
         return cos_slice, sin_slice
 
     cos, sin = _slice_rope_frequencies(cos, sin)
+    if _cp_debug_enabled() and cp_active:
+        _cp_debug(
+            f"[CP-DEBUG][attn] rank={cp_rank_index}/{cp_size} q_len={q_len} kv_seq_len={kv_seq_len} required_seq_len={required_seq_len}"
+        )
     Q, K = fast_rope_embedding(Q, K, cos, sin)
 
     if past_key_value is not None:
@@ -646,6 +651,11 @@ def LlamaAttention_fast_forward(
         and attention_mask is None
     )
     use_flash = (not cp_active) and HAS_FLASH_ATTENTION and attention_mask is None
+
+    if cp_active and (use_xformers or use_flash) and _cp_debug_enabled():
+        _cp_debug(
+            "[CP-DEBUG][attn] Context parallel requested but non-SDPA path selected; forcing SDPA."
+        )
 
     if use_xformers:
         # Xformers memory efficient attention
@@ -1476,6 +1486,13 @@ def CausalLM_fast_forward(fast_forward_inference):
             logits = self.lm_head(hidden_states.to(dtype))
 
         logits = logits.to(_get_dtype(dtype_from_config(self.config)))
+        if _cp_debug_enabled():
+            cp_manager = get_active_context_parallel_manager()
+            if cp_manager and cp_manager.enabled and torch.is_tensor(logits):
+                checksum = logits.detach().float().sum().item()
+                _cp_debug(
+                    f"[CP-DEBUG][logits] rank={cp_manager.cp_rank_index} shape={tuple(logits.shape)} checksum={checksum:.4f}"
+                )
         loss = None
         logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
         logit_scaling = getattr(self.config, "logit_scale", 0)
