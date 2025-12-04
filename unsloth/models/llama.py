@@ -61,7 +61,10 @@ from transformers.modeling_attn_mask_utils import (
 )
 from ..kernels import *
 from ..tokenizer_utils import *
-from ..context_parallel import is_context_parallel_active, _cp_debug_enabled
+from ..context_parallel import (
+    get_active_context_parallel_manager,
+    _cp_debug_enabled,
+)
 
 if HAS_FLASH_ATTENTION:
     from flash_attn import flash_attn_func
@@ -570,25 +573,63 @@ def LlamaAttention_fast_forward(
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
 
-    if position_embeddings and kv_seq_len <= position_embeddings[0].shape[0]:
+    cp_manager = get_active_context_parallel_manager()
+    cp_active = bool(cp_manager and cp_manager.enabled)
+    cp_size = cp_manager.settings.size if cp_manager else 1
+    cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
+
+    required_seq_len = kv_seq_len
+    if isinstance(position_ids, torch.Tensor) and position_ids.numel() > 0:
+        max_position = int(position_ids.max().item()) + 1
+        required_seq_len = max(required_seq_len, max_position)
+    elif cp_active and cp_size > 1:
+        required_seq_len = max(required_seq_len, q_len * cp_size)
+
+    if (
+        position_embeddings
+        and required_seq_len <= position_embeddings[0].shape[0]
+        and required_seq_len <= position_embeddings[1].shape[0]
+    ):
         cos, sin = position_embeddings
     else:
         # Extend RoPE dynamically to fit in VRA
         rotary_emb = self.rotary_emb
-        rotary_emb.extend_rope_embedding(V, seq_len = kv_seq_len)
+        rotary_emb.extend_rope_embedding(V, seq_len = required_seq_len)
+        cos, sin = rotary_emb.get_cached(required_seq_len, Q.device.index)
 
-        # if position_ids is None:
-        #     # Useful for LongRoPE
-        #     cos, sin = rotary_emb.get_cached(kv_seq_len, device = Q.device)
-        # else:
-        #     cos, sin = rotary_emb.get_cached(seq_len = kv_seq_len, device = Q.device)
-        cos, sin = rotary_emb.get_cached(kv_seq_len, Q.device.index)
+    def _slice_rope_frequencies(
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_len = q_len
+        if isinstance(position_ids, torch.Tensor):
+            ids = position_ids
+            if ids.ndim > 1:
+                flat_ids = ids.view(-1, ids.shape[-1])
+                if flat_ids.shape[0] > 1:
+                    all_equal = torch.all(flat_ids == flat_ids[0]).item()
+                    if not all_equal:
+                        raise RuntimeError(
+                            "fast_rope_embedding requires identical position_ids across the batch."
+                        )
+                ids = flat_ids[0]
+            ids = ids.to(device = cos.device, dtype = torch.long)
+            ids = ids[..., -target_len:]
+            cos_slice = cos.index_select(0, ids)
+            sin_slice = sin.index_select(0, ids)
+            return cos_slice, sin_slice
+        start = 0
+        if cp_active and cp_size > 1:
+            start = cp_rank_index * target_len
+        if cos.shape[0] < start + target_len or sin.shape[0] < start + target_len:
+            raise RuntimeError(
+                "RoPE cache is smaller than the requested context-parallel slice."
+            )
+        cos_slice = cos.narrow(0, start, target_len)
+        sin_slice = sin.narrow(0, start, target_len)
+        return cos_slice, sin_slice
 
-    # Q, K = (
-    #     fast_rope_embedding(Q, K, cos, sin)
-    #     if position_ids is None
-    #     else inplace_rope_embedding(Q, K, cos, sin, position_ids)
-    # )
+    cos, sin = _slice_rope_frequencies(cos, sin)
     Q, K = fast_rope_embedding(Q, K, cos, sin)
 
     if past_key_value is not None:
@@ -597,7 +638,7 @@ def LlamaAttention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    cp_active = is_context_parallel_active()
+    # Reuse the cp_active flag computed above for backend decisions.
     use_xformers = (
         not cp_active
         and not HAS_FLASH_ATTENTION

@@ -63,7 +63,12 @@ class ContextParallelSettings:
         },
     )
     buffer_names: Tuple[str, ...] = field(
-        default_factory = lambda: ("input_ids", "attention_mask", "labels"),
+        default_factory = lambda: (
+            "input_ids",
+            "attention_mask",
+            "labels",
+            "position_ids",
+        ),
         metadata = {
             "help": (
                 "Names inside the Trainer input batch that should be sharded "
@@ -72,7 +77,7 @@ class ContextParallelSettings:
         },
     )
     no_restore_buffer_names: Tuple[str, ...] = field(
-        default_factory = tuple,
+        default_factory = lambda: ("position_ids",),
         metadata = {
             "help": (
                 "Subset of `buffer_names` that do not need to be restored after the "
@@ -80,6 +85,13 @@ class ContextParallelSettings:
             )
         },
     )
+
+    def __post_init__(self) -> None:
+        self.buffer_names = _ensure_tuple_contains(self.buffer_names, "position_ids")
+        self.no_restore_buffer_names = _ensure_tuple_contains(
+            self.no_restore_buffer_names,
+            "position_ids",
+        )
 
     @classmethod
     def from_args(cls, args: Optional[object]) -> "ContextParallelSettings":
@@ -94,10 +106,17 @@ class ContextParallelSettings:
         buffer_names = _as_tuple(
             _get(
                 "context_parallel_buffer_names",
-                ("input_ids", "attention_mask", "labels"),
+                ("input_ids", "attention_mask", "labels", "position_ids"),
             )
         )
-        no_restore = _as_tuple(_get("context_parallel_no_restore", ()))
+        buffer_names = _ensure_tuple_contains(buffer_names, "position_ids")
+        no_restore = _as_tuple(
+            _get(
+                "context_parallel_no_restore",
+                ("position_ids",),
+            )
+        )
+        no_restore = _ensure_tuple_contains(no_restore, "position_ids")
         return cls(
             size = size,
             seq_dim = seq_dim,
@@ -113,6 +132,12 @@ def _as_tuple(value) -> Tuple[str, ...]:
         items = [item.strip() for item in value.split(",")]
         return tuple(item for item in items if item)
     return tuple(value)
+
+
+def _ensure_tuple_contains(values: Tuple[str, ...], name: str) -> Tuple[str, ...]:
+    if name in values:
+        return values
+    return values + (name,)
 
 
 class ContextParallelManager:
@@ -214,6 +239,10 @@ class ContextParallelManager:
     def data_parallel_world_size(self) -> int:
         return self._dp_world_size
 
+    @property
+    def cp_rank_index(self) -> int:
+        return self._cp_rank_index
+
     def data_parallel_rank(self) -> int:
         if (
             not torch.distributed.is_available()
@@ -242,27 +271,52 @@ class ContextParallelManager:
                 no_restore.add(tensor)
         return buffers, seq_dims, no_restore
 
+    def _ensure_position_ids(self, inputs: dict[str, torch.Tensor]) -> None:
+        if not self.enabled:
+            return
+        if isinstance(inputs.get("position_ids"), torch.Tensor):
+            return
+        input_ids = inputs.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor):
+            return
+        if input_ids.ndim <= self.settings.seq_dim:
+            return
+        seq_len = input_ids.size(self.settings.seq_dim)
+        if seq_len <= 0:
+            return
+        device = input_ids.device
+        dtype = torch.int32
+        positions = torch.arange(seq_len, dtype = dtype, device = device)
+        view_shape = [1] * input_ids.ndim
+        view_shape[self.settings.seq_dim] = seq_len
+        positions = positions.view(view_shape).expand_as(input_ids).clone()
+        inputs["position_ids"] = positions
+
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
+        token = None
         if self.enabled:
-            _ACTIVE_MANAGER.set(self)
-        if not self.enabled or self._mesh is None:
-            yield
-            return
-        self._adjust_num_items_in_batch(inputs)
-        buffers, seq_dims, no_restore = self._collect_buffers(inputs)
-        if not buffers:
-            yield
+            token = _ACTIVE_MANAGER.set(self)
+        try:
+            if not self.enabled or self._mesh is None:
+                yield
+                return
+            self._adjust_num_items_in_batch(inputs)
+            self._ensure_position_ids(inputs)
+            buffers, seq_dims, no_restore = self._collect_buffers(inputs)
+            if not buffers:
+                yield
+                return
+            with context_parallel(
+                self._mesh,
+                buffers = buffers,
+                buffer_seq_dims = seq_dims,
+                no_restore_buffers = no_restore,
+            ):
+                yield
+        finally:
             if token is not None:
                 _ACTIVE_MANAGER.reset(token)
-            return
-        with context_parallel(
-            self._mesh,
-            buffers = buffers,
-            buffer_seq_dims = seq_dims,
-            no_restore_buffers = no_restore,
-        ):
-            yield
 
     @contextlib.contextmanager
     def replay_context(self):
@@ -454,7 +508,12 @@ def _patch_sft_config(trl_module):
             },
         )
         context_parallel_buffer_names: Tuple[str, ...] = field(
-            default_factory = lambda: ("input_ids", "attention_mask", "labels"),
+            default_factory = lambda: (
+                "input_ids",
+                "attention_mask",
+                "labels",
+                "position_ids",
+            ),
             metadata = {
                 "help": (
                     "Batch keys whose tensors should be sharded across context parallel ranks. "
@@ -463,7 +522,7 @@ def _patch_sft_config(trl_module):
             },
         )
         context_parallel_no_restore: Tuple[str, ...] = field(
-            default_factory = tuple,
+            default_factory = lambda: ("position_ids",),
             metadata = {
                 "help": (
                     "Subset of `context_parallel_buffer_names` that do not need to be restored after "
