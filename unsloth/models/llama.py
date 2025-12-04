@@ -565,21 +565,6 @@ def LlamaAttention_fast_forward(
     head_dim = self.head_dim
     assert n_kv_heads * n_groups == n_heads
 
-    _cp_log_tensor("hidden_states", hidden_states, 1)
-    Q, K, V = self.apply_qkv(self, hidden_states)
-    Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
-    K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
-    V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
-
-    kv_seq_len = K.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value[0].shape[-2]
-
-    cp_manager = get_active_context_parallel_manager()
-    cp_active = bool(cp_manager and cp_manager.enabled)
-    cp_size = cp_manager.settings.size if cp_manager else 1
-    cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
-
     def _cp_log_tensor(tag: str, tensor: torch.Tensor, seq_dim: int) -> None:
         if not _cp_debug_enabled() or not torch.is_tensor(tensor):
             return
@@ -596,6 +581,21 @@ def LlamaAttention_fast_forward(
         _cp_debug(
             f"[CP-DEBUG][attn-in] rank=0/1 layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f} halves=({first:.6f},{second:.6f})"
         )
+
+    _cp_log_tensor("hidden_states", hidden_states, 1)
+    Q, K, V = self.apply_qkv(self, hidden_states)
+    Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
+    K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+    V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+
+    kv_seq_len = K.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+
+    cp_manager = get_active_context_parallel_manager()
+    cp_active = bool(cp_manager and cp_manager.enabled)
+    cp_size = cp_manager.settings.size if cp_manager else 1
+    cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
 
     if (
         cp_active
