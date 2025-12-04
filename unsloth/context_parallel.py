@@ -21,7 +21,8 @@ try:
     # Disable load balancing in context parallel to debug divergence
     from torch.distributed.tensor.experimental._attention import _cp_options
 
-    _cp_options.enable_load_balance = False
+    # _cp_options.enable_load_balance = False
+    _cp_options.enable_load_balance = True
 except (ImportError, AttributeError):  # pragma: no cover - handled at runtime
     context_parallel = None  # type: ignore[assignment]
     DeviceMesh = None  # type: ignore[assignment]
