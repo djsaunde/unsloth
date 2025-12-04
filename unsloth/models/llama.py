@@ -77,6 +77,13 @@ def _cp_log_sequence_tensor(
 ) -> None:
     if not (_cp_debug_enabled() and torch.is_tensor(tensor)):
         return
+    mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
+    if mode == "off":
+        return
+    if focus and mode != "focused":
+        return
+    if not focus and mode != "all":
+        return
     manager = get_active_context_parallel_manager()
     cp_active = bool(manager and manager.enabled)
     cp_size = manager.settings.size if manager else 1
@@ -114,6 +121,8 @@ def _cp_log_embed_consistency(
     inputs_embeds: Optional[torch.Tensor],
 ) -> None:
     if not _cp_debug_enabled():
+        return
+    if os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() != "focused":
         return
     if input_ids is None or inputs_embeds is None:
         return
@@ -162,6 +171,29 @@ def _cp_log_embed_consistency(
     if cp_manager.cp_rank_index == 0:
         chunks = ", ".join(f"{value:.6f}" for value in baseline.tolist())
         _cp_debug(f"[CP-DEBUG][focus] embed-baseline chunks=[{chunks}]")
+
+
+def _reference_rms_norm(layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
+    eps = getattr(layernorm, "variance_epsilon", getattr(layernorm, "eps", 1e-6))
+    variance = hidden_states.to(torch.float32)
+    variance = variance.pow(2).mean(-1, keepdim = True)
+    inv = torch.rsqrt(variance + eps)
+    inv = inv.to(dtype = hidden_states.dtype)
+    normed = hidden_states * inv
+    weight = layernorm.weight
+    if torch.is_tensor(weight) and weight.dtype != hidden_states.dtype:
+        weight = weight.to(hidden_states.dtype)
+    return normed * weight
+
+
+def _cp_should_use_reference_rms(layer) -> bool:
+    if os.environ.get("UNSLOTH_CP_FORCE_FAST_RMS", "0") == "1":
+        return False
+    manager = get_active_context_parallel_manager()
+    if not (manager and manager.enabled):
+        return False
+    layer_id = getattr(layer, "layer_idx", None)
+    return layer_id in (0, None)
 
 
 if HAS_FLASH_ATTENTION:
@@ -931,13 +963,20 @@ def LlamaDecoderLayer_fast_forward(
                 focus = True,
             )
 
+    use_reference_rms = _cp_should_use_reference_rms(self)
+
+    def _apply_rms(norm_module, tensor: torch.Tensor, inference: bool):
+        if use_reference_rms:
+            return _reference_rms_norm(norm_module, tensor)
+        if inference:
+            return fast_rms_layernorm_inference(norm_module, tensor)
+        return fast_rms_layernorm(norm_module, tensor)
+
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
         _cp_log_layernorm("input.pre", hidden_states)
         _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
-        hidden_states = fast_rms_layernorm_inference(
-            self.input_layernorm, hidden_states
-        )
+        hidden_states = _apply_rms(self.input_layernorm, hidden_states, True)
         _cp_log_layernorm("input.post", hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
@@ -956,8 +995,10 @@ def LlamaDecoderLayer_fast_forward(
         residual = hidden_states
         _cp_log_layernorm("post.pre", hidden_states)
         _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
-        hidden_states = fast_rms_layernorm_inference(
-            self.post_attention_layernorm, hidden_states
+        hidden_states = _apply_rms(
+            self.post_attention_layernorm,
+            hidden_states,
+            True,
         )
         _cp_log_layernorm("post.post", hidden_states)
         hidden_states = fast_swiglu_inference(self.mlp, hidden_states)
@@ -966,7 +1007,7 @@ def LlamaDecoderLayer_fast_forward(
         residual = hidden_states
         _cp_log_layernorm("input.pre", hidden_states)
         _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
-        hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
+        hidden_states = _apply_rms(self.input_layernorm, hidden_states, False)
         _cp_log_layernorm("input.post", hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
@@ -985,7 +1026,11 @@ def LlamaDecoderLayer_fast_forward(
         residual = hidden_states
         _cp_log_layernorm("post.pre", hidden_states)
         _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
-        hidden_states = fast_rms_layernorm(self.post_attention_layernorm, hidden_states)
+        hidden_states = _apply_rms(
+            self.post_attention_layernorm,
+            hidden_states,
+            False,
+        )
         _cp_log_layernorm("post.post", hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states

@@ -826,7 +826,9 @@ def _cp_debug_enabled() -> bool:
 def _cp_debug(msg: str) -> None:
     if not _cp_debug_enabled():
         return
-    mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "focused").lower()
+    mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
+    if mode == "off":
+        return
     if mode == "focused" and "[CP-DEBUG][focus]" not in msg:
         return
     print(msg, flush = True)
