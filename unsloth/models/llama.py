@@ -25,7 +25,7 @@ from ._utils import (
     _get_inference_mode_context_manager,
     _prepare_model_for_qat,
 )
-from torch.nn.functional import scaled_dot_product_attention
+import torch.nn.functional as F
 from transformers import __version__ as transformers_version
 from unsloth_zoo.utils import Version, _get_dtype
 from unsloth_zoo.hf_utils import (
@@ -141,7 +141,7 @@ from math import sqrt as math_sqrt
 KV_CACHE_INCREMENT = 512  # KV Cache update size
 torch_nn_functional_softmax = torch.nn.functional.softmax
 # SDPA has GQA internally
-SDPA_HAS_GQA = "enable_gqa" in scaled_dot_product_attention.__doc__
+SDPA_HAS_GQA = "enable_gqa" in F.scaled_dot_product_attention.__doc__
 
 
 # Fix new HF's inference code
@@ -428,7 +428,7 @@ def LlamaAttention_fast_forward_inference(
         A = torch_matmul(A, Vnn, out = Qn)
     else:
         if SDPA_HAS_GQA:
-            A = scaled_dot_product_attention(
+            A = F.scaled_dot_product_attention(
                 Qn,
                 Knn,
                 Vnn,
@@ -437,7 +437,7 @@ def LlamaAttention_fast_forward_inference(
                 enable_gqa = True,
             )
         else:
-            A = scaled_dot_product_attention(
+            A = F.scaled_dot_product_attention(
                 Qn, Knn, Vnn, attn_mask = attention_mask, is_causal = is_causal
             )
     A = A.transpose(1, 2)
@@ -695,7 +695,7 @@ def LlamaAttention_fast_forward(
         if SDPA_HAS_GQA:
             # Needs (batch_size, n_heads, seq_len, head_dim)
             # is_casual and attention_mask must not be both set!
-            A = scaled_dot_product_attention(
+            A = F.scaled_dot_product_attention(
                 Q,
                 K,
                 V,
@@ -721,7 +721,7 @@ def LlamaAttention_fast_forward(
             Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
             # Needs (batch_size, n_heads, seq_len, head_dim)
             # is_casual and attention_mask must not be both set!
-            A = scaled_dot_product_attention(
+            A = F.scaled_dot_product_attention(
                 Q, K, V, attn_mask = attention_mask, is_causal = is_causal
             )
             # Go back to (batch_size, seq_len, n_heads, head_dim)

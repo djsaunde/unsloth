@@ -646,6 +646,7 @@ if is_openai_available():
 
 # =============================================
 # Get Flash Attention v2 if Ampere (RTX 30xx, A100)
+import os
 import bitsandbytes as bnb
 
 from transformers import AutoTokenizer
@@ -654,12 +655,16 @@ from transformers.utils.import_utils import _is_package_available
 SUPPORTS_BFLOAT16 = False
 HAS_FLASH_ATTENTION = False
 HAS_FLASH_ATTENTION_SOFTCAPPING = False
+_DISABLE_FLASH_ATTENTION = bool(
+    os.environ.get("UNSLOTH_DISABLE_FLASH_ATTENTION")
+    or os.environ.get("UNSLOTH_FORCE_SDPA")
+)
 
 if DEVICE_TYPE == "cuda":
     major_version, minor_version = torch.cuda.get_device_capability()
     torch.cuda.get_device_capability = functools.cache(torch.cuda.get_device_capability)
 
-    if major_version >= 8:
+    if major_version >= 8 and not _DISABLE_FLASH_ATTENTION:
         SUPPORTS_BFLOAT16 = True
         if _is_package_available("flash_attn"):
             # Check for CUDA linking errors "undefined symbol: _ZNK3c106SymIntltEl"
@@ -713,7 +718,7 @@ if DEVICE_TYPE == "cuda":
         HAS_FLASH_ATTENTION = False
 elif DEVICE_TYPE == "hip":
     SUPPORTS_BFLOAT16 = True
-    if _is_package_available("flash_attn"):
+    if _is_package_available("flash_attn") and not _DISABLE_FLASH_ATTENTION:
         # Check for CUDA linking errors "undefined symbol: _ZNK3c106SymIntltEl"
         try:
             try:
