@@ -73,6 +73,7 @@ def _cp_log_sequence_tensor(
     tag: str,
     tensor: Optional[torch.Tensor],
     seq_dim: int = 1,
+    focus: bool = False,
 ) -> None:
     if not (_cp_debug_enabled() and torch.is_tensor(tensor)):
         return
@@ -82,7 +83,10 @@ def _cp_log_sequence_tensor(
     cp_rank_index = manager.cp_rank_index if manager else 0
     shape = tuple(tensor.shape)
     checksum = tensor.detach().float().sum().item()
-    prefix = f"[CP-DEBUG][{tag}]"
+    if focus:
+        prefix = f"[CP-DEBUG][focus] {tag}"
+    else:
+        prefix = f"[CP-DEBUG][{tag}]"
     if tensor.ndim == 0:
         seq_len = 0
         seq_dim_resolved = 0
@@ -90,9 +94,8 @@ def _cp_log_sequence_tensor(
         seq_dim_resolved = seq_dim % tensor.ndim
         seq_len = tensor.size(seq_dim_resolved)
     if cp_active:
-        _cp_debug(
-            f"{prefix} rank={cp_rank_index}/{cp_size} shape={shape} checksum={checksum:.6f}"
-        )
+        message = f"{prefix} rank={cp_rank_index}/{cp_size} shape={shape} checksum={checksum:.6f}"
+        _cp_debug(message)
         return
     message = f"{prefix} rank=0/1 shape={shape} checksum={checksum:.6f}"
     if seq_len > 0 and seq_len % 2 == 0:
@@ -907,7 +910,12 @@ def LlamaDecoderLayer_fast_forward(
         layer_id = getattr(self, "layer_idx", None)
         if layer_id not in (0, None):
             return
-        _cp_log_sequence_tensor(f"ln.{stage}.layer={layer_id}", tensor, 1)
+        _cp_log_sequence_tensor(
+            f"ln.{stage}.layer={layer_id}",
+            tensor,
+            1,
+            focus = True,
+        )
 
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
