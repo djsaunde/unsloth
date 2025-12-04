@@ -713,16 +713,19 @@ def LlamaAttention_fast_forward(
             return
         checksum = tensor.detach().float().sum().item()
         shape = tuple(tensor.shape)
+        prefix = "[CP-DEBUG][attn-in]"
+        if mode == "focused":
+            prefix = "[CP-DEBUG][focus] attn"
         if cp_active or tensor.size(seq_dim) % 2 != 0:
             _cp_debug(
-                f"[CP-DEBUG][attn-in] rank={cp_rank_index}/{cp_size} layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f}"
+                f"{prefix} rank={cp_rank_index}/{cp_size} layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f}"
             )
             return
         half = tensor.size(seq_dim) // 2
         first = tensor.narrow(seq_dim, 0, half).detach().float().sum().item()
         second = tensor.narrow(seq_dim, half, half).detach().float().sum().item()
         _cp_debug(
-            f"[CP-DEBUG][attn-in] rank=0/1 layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f} halves=({first:.6f},{second:.6f})"
+            f"{prefix} rank=0/1 layer={getattr(self, 'layer_idx', None)} {tag} shape={shape} checksum={checksum:.6f} halves=({first:.6f},{second:.6f})"
         )
 
     _cp_log_tensor("hidden_states", hidden_states, 1)
@@ -897,24 +900,39 @@ def LlamaAttention_fast_forward(
         pass
     if _cp_debug_enabled():
         layer_id = getattr(self, "layer_idx", None)
-        if cp_active:
-            checksum = (
-                A.detach().float().sum().item() if torch.is_tensor(A) else float("nan")
-            )
-            _cp_debug(
-                f"[CP-DEBUG][attn-out] rank={cp_rank_index}/{cp_size} layer={layer_id} checksum={checksum:.6f}"
-            )
+        mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
+        if mode == "off":
+            pass
+        elif mode == "focused" and layer_id != 0:
+            pass
         else:
-            checksum_full = (
-                A.detach().float().sum().item() if torch.is_tensor(A) else float("nan")
-            )
-            message = f"[CP-DEBUG][attn-out] rank=0/1 layer={layer_id} checksum={checksum_full:.6f}"
-            if torch.is_tensor(A) and A.shape[1] % 2 == 0:
-                half = A.shape[1] // 2
-                first = A[:, :half].detach().float().sum().item()
-                second = A[:, half:].detach().float().sum().item()
-                message += f" halves=({first:.6f},{second:.6f})"
-            _cp_debug(message)
+            prefix = "[CP-DEBUG][attn-out]"
+            if mode == "focused":
+                prefix = "[CP-DEBUG][focus] attn"
+            if cp_active:
+                checksum = (
+                    A.detach().float().sum().item()
+                    if torch.is_tensor(A)
+                    else float("nan")
+                )
+                _cp_debug(
+                    f"{prefix} rank={cp_rank_index}/{cp_size} layer={layer_id} checksum={checksum:.6f}"
+                )
+            else:
+                checksum_full = (
+                    A.detach().float().sum().item()
+                    if torch.is_tensor(A)
+                    else float("nan")
+                )
+                message = (
+                    f"{prefix} rank=0/1 layer={layer_id} checksum={checksum_full:.6f}"
+                )
+                if torch.is_tensor(A) and A.shape[1] % 2 == 0:
+                    half = A.shape[1] // 2
+                    first = A[:, :half].detach().float().sum().item()
+                    second = A[:, half:].detach().float().sum().item()
+                    message += f" halves=({first:.6f},{second:.6f})"
+                _cp_debug(message)
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
     attn_output = self.apply_o(self, attn_output)
     attn_weights = None
@@ -977,9 +995,11 @@ def LlamaDecoderLayer_fast_forward(
         _cp_debug_enabled()
         and os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() == "focused"
     )
+    layer_id = getattr(self, "layer_idx", None)
     if (
         use_reference_rms
         and focus_logging
+        and layer_id == 0
         and not getattr(self, "_cp_reference_rms_logged", False)
     ):
         setattr(self, "_cp_reference_rms_logged", True)
