@@ -411,17 +411,35 @@ class ContextParallelManager:
 
     def _loss_weight(self, inputs: dict[str, torch.Tensor], reference: torch.Tensor):
         if not isinstance(reference, torch.Tensor):
+            if _cp_debug_enabled():
+                _cp_debug(
+                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: reference is not tensor"
+                )
             return None
         labels = self._rank_slice(inputs.get("labels"))
         if isinstance(labels, torch.Tensor):
             weight = labels.ne(-100).sum()
+            if _cp_debug_enabled():
+                _cp_debug(
+                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: labels shape={labels.shape} "
+                    f"valid_tokens={weight.item()}"
+                )
             if weight.item() > 0:
                 return weight.to(device = reference.device, dtype = reference.dtype)
         attention_mask = self._rank_slice(inputs.get("attention_mask"))
         if isinstance(attention_mask, torch.Tensor):
             weight = attention_mask.sum()
+            if _cp_debug_enabled():
+                _cp_debug(
+                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: attention_mask shape={attention_mask.shape} "
+                    f"sum={weight.item()}"
+                )
             if weight.item() > 0:
                 return weight.to(device = reference.device, dtype = reference.dtype)
+        if _cp_debug_enabled():
+            _cp_debug(
+                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _loss_weight: returning None (no valid weight found)"
+            )
         return None
 
     def _local_valid_token_count(
@@ -477,6 +495,16 @@ class ContextParallelManager:
         if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
             return loss
 
+        # Debug: Check if labels exist in inputs after context manager
+        if _cp_debug_enabled():
+            labels_in = inputs.get("labels")
+            _cp_debug(
+                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] reduce_loss inputs.labels "
+                f"exists={labels_in is not None} "
+                f"is_tensor={torch.is_tensor(labels_in)} "
+                f"shape={getattr(labels_in, 'shape', None)}"
+            )
+
         def _reduce_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             if tensor is None or not torch.is_tensor(tensor):
                 zeros = torch.zeros(
@@ -487,6 +515,12 @@ class ContextParallelManager:
                 return tensor, zeros
             weight = self._loss_weight(inputs, tensor)
             if weight is None:
+                if _cp_debug_enabled():
+                    _cp_debug(
+                        f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _reduce_tensor: weight is None! "
+                        f"Falling back to dividing by CP size ({self.settings.size}). "
+                        f"raw_loss={tensor.item()}"
+                    )
                 summed = tensor.clone()
                 dist.all_reduce(summed, op = dist.ReduceOp.SUM, group = self._cp_group)
                 total_tokens = torch.tensor(
@@ -495,9 +529,19 @@ class ContextParallelManager:
                     device = summed.device,
                 )
                 return summed, total_tokens
+            if _cp_debug_enabled():
+                _cp_debug(
+                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _reduce_tensor: "
+                    f"raw_loss={tensor.item()} local_weight={weight.item()}"
+                )
             scaled = tensor * weight
             dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
             dist.all_reduce(weight, op = dist.ReduceOp.SUM, group = self._cp_group)
+            if _cp_debug_enabled():
+                _cp_debug(
+                    f"[CP-DEBUG][cp-rank={self._cp_rank_index}] _reduce_tensor after all_reduce: "
+                    f"summed_scaled={scaled.item()} total_weight={weight.item()}"
+                )
             return scaled, weight
 
         def _finalize(summed, tokens):
