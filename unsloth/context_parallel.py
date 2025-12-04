@@ -499,10 +499,11 @@ class ContextParallelManager:
         if _cp_debug_enabled():
             labels_in = inputs.get("labels")
             _cp_debug(
-                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] reduce_loss inputs.labels "
+                f"[CP-DEBUG][focus] reduce_loss inputs.labels "
                 f"exists={labels_in is not None} "
                 f"is_tensor={torch.is_tensor(labels_in)} "
-                f"shape={getattr(labels_in, 'shape', None)}"
+                f"shape={getattr(labels_in, 'shape', None)} "
+                f"cp-rank={self._cp_rank_index}"
             )
 
         def _reduce_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
