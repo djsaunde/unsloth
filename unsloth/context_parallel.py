@@ -300,7 +300,13 @@ class ContextParallelManager:
             view_shape = [1] * input_ids.ndim
             view_shape[self.settings.seq_dim] = seq_len
             positions = base.view(view_shape).expand_as(input_ids)
-        inputs["position_ids"] = positions.to(dtype = torch.long)
+        positions = positions.to(dtype = torch.long)
+        inputs["position_ids"] = positions
+        if _cp_debug_enabled():
+            preview = positions.flatten().tolist()[: min(16, positions.numel())]
+            _cp_debug(
+                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] synthesized position_ids preview={preview}"
+            )
 
     def _debug_validate_buffers(
         self,
