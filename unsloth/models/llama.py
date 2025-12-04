@@ -946,7 +946,7 @@ def LlamaDecoderLayer_fast_forward(
 
     def _cp_log_rms_inputs(stage: str, tensor: torch.Tensor, norm_module) -> None:
         layer_id = getattr(self, "layer_idx", None)
-        if layer_id not in (0, None):
+        if layer_id != 0:
             return
         _cp_log_sequence_tensor(
             f"rms.{stage}.input.layer={layer_id}",
@@ -1370,6 +1370,14 @@ def LlamaModel_fast_forward(
 
     # Go through every layer!
     for idx, decoder_layer in enumerate(self.layers):
+        if getattr(decoder_layer, "layer_idx", None) != idx:
+            setattr(decoder_layer, "layer_idx", idx)
+        self_attn = getattr(decoder_layer, "self_attn", None)
+        if self_attn is not None and getattr(self_attn, "layer_idx", None) != idx:
+            setattr(self_attn, "layer_idx", idx)
+        mlp = getattr(decoder_layer, "mlp", None)
+        if mlp is not None and getattr(mlp, "layer_idx", None) != idx:
+            setattr(mlp, "layer_idx", idx)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
         past_key_value = past_key_values[idx] if past_key_values is not None else None
