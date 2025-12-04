@@ -357,11 +357,19 @@ class ContextParallelManager:
             if not buffers:
                 yield
                 return
+            enable_load_balance = os.environ.get("UNSLOTH_CP_LOAD_BALANCE", "1") != "0"
+            if (
+                _cp_debug_enabled()
+                and not enable_load_balance
+                and self._cp_rank_index == 0
+            ):
+                _cp_debug("[CP-DEBUG] Context parallel load balancing disabled.")
             with context_parallel(
                 self._mesh,
                 buffers = buffers,
                 buffer_seq_dims = seq_dims,
                 no_restore_buffers = no_restore,
+                enable_load_balance = enable_load_balance,
             ):
                 yield
         finally:
