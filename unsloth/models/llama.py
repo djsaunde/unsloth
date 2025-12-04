@@ -705,6 +705,12 @@ def LlamaAttention_fast_forward(
     def _cp_log_tensor(tag: str, tensor: torch.Tensor, seq_dim: int) -> None:
         if not _cp_debug_enabled() or not torch.is_tensor(tensor):
             return
+        mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
+        if mode == "off":
+            return
+        layer_id = getattr(self, "layer_idx", None)
+        if mode == "focused" and layer_id != 0:
+            return
         checksum = tensor.detach().float().sum().item()
         shape = tuple(tensor.shape)
         if cp_active or tensor.size(seq_dim) % 2 != 0:
