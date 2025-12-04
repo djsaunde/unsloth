@@ -859,6 +859,8 @@ def LlamaModel_fast_forward(
     return_dict = (
         return_dict if return_dict is not None else self.config.use_return_dict
     )
+    cp_manager = get_active_context_parallel_manager()
+    cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
 
     # retrieve input_ids and inputs_embeds
     if input_ids is not None and inputs_embeds is not None:
@@ -912,6 +914,11 @@ def LlamaModel_fast_forward(
     if position_ids is not None:
         if position_ids.shape[0] != batch_size:
             position_ids = position_ids.repeat((batch_size, 1))
+        if _cp_debug_enabled():
+            preview = position_ids[0][: min(16, position_ids.shape[-1])].tolist()
+            _cp_debug(
+                f"[CP-DEBUG][model] rank={cp_rank_index if cp_manager else 0} local position_ids preview={preview} max={int(position_ids.max().item())}"
+            )
 
     # Embed positions
     if inputs_embeds is None:
