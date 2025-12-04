@@ -101,8 +101,23 @@ def _cp_log_sequence_tensor(
         seq_dim_resolved = seq_dim % tensor.ndim
         seq_len = tensor.size(seq_dim_resolved)
     if cp_active:
-        message = f"{prefix} rank={cp_rank_index}/{cp_size} shape={shape} checksum={checksum:.6f}"
-        _cp_debug(message)
+        if manager.process_group is None:
+            message = f"{prefix} rank={cp_rank_index}/{cp_size} shape={shape} checksum={checksum:.6f}"
+            _cp_debug(message)
+            return
+        checksums = torch.zeros(
+            cp_size,
+            dtype = torch.float32,
+            device = tensor.device,
+        )
+        local = torch.tensor([checksum], dtype = torch.float32, device = tensor.device)
+        gathered = [torch.zeros_like(local) for _ in range(cp_size)]
+        dist.all_gather(gathered, local, group = manager.process_group)
+        values = [g.item() for g in gathered]
+        if cp_rank_index == 0:
+            formatted = ", ".join(f"{v:.6f}" for v in values)
+            message = f"{prefix} rank=0/{cp_size} shape={shape} checksums=[{formatted}]"
+            _cp_debug(message)
         return
     message = f"{prefix} rank=0/1 shape={shape} checksum={checksum:.6f}"
     if seq_len > 0 and seq_len % 2 == 0:
