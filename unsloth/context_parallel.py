@@ -22,8 +22,8 @@ try:
     # Disable load balancing in context parallel to debug divergence
     from torch.distributed.tensor.experimental._attention import _cp_options
 
-    # _cp_options.enable_load_balance = False
-    _cp_options.enable_load_balance = True
+    _cp_options.enable_load_balance = False
+    # _cp_options.enable_load_balance = True
 except (ImportError, AttributeError):  # pragma: no cover - handled at runtime
     context_parallel = None  # type: ignore[assignment]
     DeviceMesh = None  # type: ignore[assignment]
@@ -574,23 +574,53 @@ class ContextParallelManager:
                     device = tensor.device if torch.is_tensor(tensor) else None,
                 )
                 return tensor, zeros
-            # Each rank's loss is already the mean over its local tokens.
-            # Sum the means across ranks to get the total loss for the batch.
+
+            # Count valid tokens from sharded shift_labels (stays sharded due to no_restore)
+            # This gives us the correct local token count for weighted averaging
+            shift_labels = inputs.get("shift_labels")
+            if isinstance(shift_labels, torch.Tensor):
+                # Count non-ignored tokens (-100 is ignore_index)
+                local_weight = (
+                    shift_labels.ne(-100)
+                    .sum()
+                    .to(device = tensor.device, dtype = tensor.dtype)
+                )
+            else:
+                # Fallback: use sharded labels if available
+                labels = inputs.get("labels")
+                if isinstance(labels, torch.Tensor):
+                    local_weight = (
+                        labels.ne(-100)
+                        .sum()
+                        .to(device = tensor.device, dtype = tensor.dtype)
+                    )
+                else:
+                    # Last resort: assume equal distribution
+                    local_weight = torch.tensor(
+                        1.0, dtype = tensor.dtype, device = tensor.device
+                    )
+
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] _reduce_tensor: "
-                    f"raw_loss={tensor.item()} cp-rank={self._cp_rank_index}"
+                    f"raw_loss={tensor.item()} local_weight={local_weight.item()} "
+                    f"cp-rank={self._cp_rank_index}"
                 )
-            summed = tensor.clone()
-            dist.all_reduce(summed, op = dist.ReduceOp.SUM, group = self._cp_group)
+
+            # Convert mean to sum: sum = mean * count
+            scaled = tensor * local_weight
+            # All-reduce to get global sum and global count
+            dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
+            dist.all_reduce(local_weight, op = dist.ReduceOp.SUM, group = self._cp_group)
+
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] _reduce_tensor after all_reduce: "
-                    f"summed={summed.item()} cp-rank={self._cp_rank_index}"
+                    f"global_sum={scaled.item()} global_weight={local_weight.item()} "
+                    f"cp-rank={self._cp_rank_index}"
                 )
-            # Return summed with weight=1 so _finalize just returns summed as-is
-            ones = torch.ones((), dtype = summed.dtype, device = summed.device)
-            return summed, ones
+
+            return scaled, local_weight
 
         def _finalize(summed, tokens):
             eps = torch.finfo(summed.dtype).eps
