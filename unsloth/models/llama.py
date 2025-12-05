@@ -2236,6 +2236,19 @@ def CausalLM_fast_forward(fast_forward_inference):
                 effective_labels = (
                     _get_shift_labels() if has_pre_shift_labels else labels
                 )
+                _cp_log_sequence_tensor(
+                    "loss-hidden_states",
+                    hidden_states,
+                    1,
+                    focus = True,
+                )
+                if torch.is_tensor(effective_labels):
+                    _cp_log_sequence_tensor(
+                        "loss-labels",
+                        effective_labels,
+                        1,
+                        focus = True,
+                    )
                 loss = unsloth_fused_ce_loss(
                     trainer = None,
                     hidden_states = hidden_states,
@@ -2311,6 +2324,19 @@ def CausalLM_fast_forward(fast_forward_inference):
             n_items = kwargs.get("num_items_in_batch", None)
             if n_items is None:
                 n_items = kwargs.get("n_items", None)
+            _cp_log_sequence_tensor(
+                "loss-shifted-logits",
+                shift_logits,
+                1,
+                focus = True,
+            )
+            if torch.is_tensor(loss_shift_labels):
+                _cp_log_sequence_tensor(
+                    "loss-shifted-labels",
+                    loss_shift_labels,
+                    1,
+                    focus = True,
+                )
             if _cp_debug_enabled() and torch.is_tensor(loss_shift_labels):
                 local_valid_tokens = loss_shift_labels.ne(-100).sum().item()
                 n_items_value = n_items.item() if torch.is_tensor(n_items) else n_items
