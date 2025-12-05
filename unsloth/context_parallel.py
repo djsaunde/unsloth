@@ -914,18 +914,26 @@ def _patch_sft_trainer(trl_module) -> None:
                     f"[CP-DEBUG][rank={rank}] before loss input_ids shape={getattr(ids, 'shape', None)} preview={preview}"
                 )
 
-            # For context parallelism with shift_labels, compute loss externally
-            # to handle load-balanced token distribution correctly
+            # For context parallelism with shift_labels, prefer letting the model
+            # handle the pre-shifted targets when it advertises support. Otherwise
+            # fall back to an external loss that consumes the sharded tensors.
             shift_labels = inputs.get("shift_labels")
-            use_external_loss = (
+            use_cp_shift_labels = (
                 manager and manager.enabled and isinstance(shift_labels, torch.Tensor)
             )
+            model_supports_shift_labels = bool(
+                getattr(
+                    model,
+                    "_unsloth_supports_context_parallel_shift_labels",
+                    False,
+                )
+            )
 
-            if use_external_loss:
+            if use_cp_shift_labels and not model_supports_shift_labels:
                 # Remove labels so model doesn't compute loss internally
                 saved_labels = inputs.pop("labels", None)
-                # Also remove shift_labels from inputs (model doesn't need it)
-                inputs.pop("shift_labels", None)
+                # Also remove shift_labels from inputs (model doesn't expect it)
+                local_shift_labels = inputs.pop("shift_labels", None)
 
                 # Get model outputs (logits only, no loss)
                 outputs = model(**inputs)
@@ -941,7 +949,7 @@ def _patch_sft_trainer(trl_module) -> None:
                 vocab_size = logits.size(-1)
                 loss = loss_fct(
                     logits.view(-1, vocab_size),
-                    shift_labels.view(-1),
+                    local_shift_labels.view(-1),
                 )
 
                 if _cp_debug_enabled():
@@ -953,6 +961,8 @@ def _patch_sft_trainer(trl_module) -> None:
                 # Restore labels for reduce_loss token counting
                 if saved_labels is not None:
                     inputs["labels"] = saved_labels
+                if local_shift_labels is not None:
+                    inputs["shift_labels"] = local_shift_labels
 
                 if return_outputs:
                     loss = (loss, outputs)

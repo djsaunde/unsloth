@@ -2073,6 +2073,7 @@ def CausalLM_fast_forward(fast_forward_inference):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        shift_labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -2137,6 +2138,24 @@ def CausalLM_fast_forward(fast_forward_inference):
         hidden_states = hidden_states.to(lm_head_device)
         if labels is not None:
             labels = labels.to(lm_head_device)
+        if shift_labels is not None:
+            shift_labels = shift_labels.to(lm_head_device)
+
+        has_pre_shift_labels = torch.is_tensor(shift_labels)
+        shift_label_cache: Optional[torch.Tensor] = None
+
+        def _get_shift_labels():
+            nonlocal shift_label_cache
+            if shift_label_cache is not None:
+                return shift_label_cache
+            if has_pre_shift_labels:
+                shift_label_cache = shift_labels
+            elif labels is not None:
+                cached = torch.empty_like(labels)
+                cached[..., :-1] = labels[..., 1:]
+                cached[..., -1] = -100
+                shift_label_cache = cached
+            return shift_label_cache
 
         # Output last hidden states without logits if asked
         if os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1":
@@ -2205,18 +2224,22 @@ def CausalLM_fast_forward(fast_forward_inference):
                 #     num_items_in_batch = n_items,
                 #     logit_softcapping  = logit_softcapping,
                 # )
+                effective_labels = (
+                    _get_shift_labels() if has_pre_shift_labels else labels
+                )
                 loss = unsloth_fused_ce_loss(
                     trainer = None,
                     hidden_states = hidden_states,
                     lm_head_weight = lm_head,
                     lm_head_bias = None,
-                    labels = labels,
+                    labels = effective_labels,
                     mask = None,
                     n_items = n_items,
                     scaling = getattr(self, "accelerator_scaler", None),
                     target_gb = None,
                     torch_compile = True,
                     logit_softcapping = logit_softcapping,
+                    shift_labels = not has_pre_shift_labels,
                 )
                 if _cp_debug_enabled() and torch.is_tensor(loss):
                     _cp_debug(
@@ -2273,16 +2296,9 @@ def CausalLM_fast_forward(fast_forward_inference):
         elif self.config.model_type == "falcon_h1":
             logit_scaling = self.config.lm_head_multiplier
 
-        if labels is not None:
+        if labels is not None or has_pre_shift_labels:
             shift_logits = logits
-            # if not hasattr(self, "extra_ignored_labels"):
-            #     # Fixes https://github.com/unslothai/unsloth/issues/10
-            #     self.extra_ignored_labels = torch.full((self.max_seq_length, 1), -100, device = "cuda:0")
-            # pass
-            shift_labels = torch.empty_like(labels)
-            shift_labels[..., :-1] = labels[..., 1:]
-            shift_labels[..., -1] = -100
-            # shift_labels = torch.hstack((labels[..., 1:], self.extra_ignored_labels[:labels.shape[0]]))
+            loss_shift_labels = _get_shift_labels()
             n_items = kwargs.get("num_items_in_batch", None)
             if n_items is None:
                 n_items = kwargs.get("n_items", None)
@@ -2309,10 +2325,10 @@ def CausalLM_fast_forward(fast_forward_inference):
                     _cp_debug(
                         f"[CP-DEBUG][loss-input logits] rank={rank_label} checksum={checksum:.6f}"
                     )
-            if _cp_debug_enabled() and torch.is_tensor(shift_labels):
-                valid = shift_labels.ne(-100)
+            if _cp_debug_enabled() and torch.is_tensor(loss_shift_labels):
+                valid = loss_shift_labels.ne(-100)
                 label_sum = (
-                    shift_labels.masked_select(valid).sum().item()
+                    loss_shift_labels.masked_select(valid).sum().item()
                     if valid.any()
                     else 0.0
                 )
@@ -2321,7 +2337,7 @@ def CausalLM_fast_forward(fast_forward_inference):
                 )
             loss = fast_cross_entropy_loss(
                 logits = shift_logits,
-                labels = shift_labels,
+                labels = loss_shift_labels,
                 logit_softcapping = logit_softcapping,
                 logit_scaling = logit_scaling,
                 n_items = n_items,
@@ -2954,7 +2970,17 @@ class FastLlamaModel:
         LlamaForCausalLM.forward = CausalLM_fast_forward(
             LlamaModel_fast_forward_inference
         )
+        setattr(
+            LlamaForCausalLM,
+            "_unsloth_supports_context_parallel_shift_labels",
+            True,
+        )
         PeftModelForCausalLM.forward = PeftModel_fast_forward
+        setattr(
+            PeftModelForCausalLM,
+            "_unsloth_supports_context_parallel_shift_labels",
+            True,
+        )
         fix_prepare_inputs_for_generation(LlamaForCausalLM)
 
         # Solves https://github.com/unslothai/unsloth/issues/168
