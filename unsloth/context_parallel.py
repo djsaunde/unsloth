@@ -1003,17 +1003,9 @@ def _patch_sft_trainer(trl_module) -> None:
         if manager:
             setattr(self.args, "_n_gpu", manager.data_parallel_world_size)
             _maybe_enable_sync_each_batch(self)
-            # Only enable static_graph if sync_each_batch is confirmed enabled
-            # (graph must be constant for static_graph to work)
-            accelerator = getattr(self, "accelerator", None)
-            if (
-                accelerator
-                and hasattr(accelerator, "gradient_state")
-                and accelerator.gradient_state.plugin_kwargs.get(
-                    "sync_each_batch", False
-                )
-            ):
-                _maybe_enable_ddp_static_graph(self)
+            # Note: static_graph is disabled because it causes internal PyTorch
+            # assertion errors with unsloth's gradient checkpointing.
+            # sync_each_batch keeps the graph constant instead.
         try:
             loss = original_training_step(self, *args, **kwargs)
         finally:
