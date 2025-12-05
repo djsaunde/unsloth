@@ -18,6 +18,11 @@ import torch.distributed as dist
 try:
     from torch.distributed.tensor.experimental import context_parallel
     from torch.distributed.tensor import DeviceMesh
+
+    # Disable load balancing in context parallel to debug divergence
+    from torch.distributed.tensor.experimental._attention import _cp_options
+
+    _cp_options.enable_load_balance = False
 except (ImportError, AttributeError):
     context_parallel = None
     DeviceMesh = None
@@ -929,43 +934,20 @@ def _patch_sft_trainer(trl_module) -> None:
                 # Compute loss using pre-shifted labels
                 # No additional shifting needed - shift_labels already contains
                 # the correct "next token" for each position after sharding
-                #
-                # Use the same logic as transformers' fixed_cross_entropy:
-                # - If num_items_in_batch is provided (gradient accumulation),
-                #   use reduction="sum" and divide by num_items_in_batch
-                # - Otherwise use reduction="mean"
-                num_items = kwargs.get("num_items_in_batch")
-                if num_items is None:
-                    num_items = inputs.get("num_items_in_batch")
+                from torch.nn import CrossEntropyLoss
 
+                loss_fct = CrossEntropyLoss()
+                # Flatten for loss computation
                 vocab_size = logits.size(-1)
-                ignore_index = -100
-
-                if num_items is not None:
-                    # Gradient accumulation: use sum reduction and divide by total tokens
-                    loss = F.cross_entropy(
-                        logits.view(-1, vocab_size),
-                        shift_labels.view(-1),
-                        ignore_index = ignore_index,
-                        reduction = "sum",
-                    )
-                    if torch.is_tensor(num_items):
-                        num_items = num_items.to(loss.device)
-                    loss = loss / num_items
-                else:
-                    # No gradient accumulation: use mean reduction
-                    loss = F.cross_entropy(
-                        logits.view(-1, vocab_size),
-                        shift_labels.view(-1),
-                        ignore_index = ignore_index,
-                        reduction = "mean",
-                    )
+                loss = loss_fct(
+                    logits.view(-1, vocab_size),
+                    shift_labels.view(-1),
+                )
 
                 if _cp_debug_enabled():
                     _cp_debug(
                         f"[CP-DEBUG][focus][rank={rank}] external loss: logits shape={logits.shape} "
-                        f"shift_labels shape={shift_labels.shape} loss={loss.item()} "
-                        f"num_items_in_batch={num_items}"
+                        f"shift_labels shape={shift_labels.shape} loss={loss.item()}"
                     )
 
                 # Restore labels for reduce_loss token counting
