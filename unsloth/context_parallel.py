@@ -1109,6 +1109,10 @@ def _cp_debug(msg: str) -> None:
     if mode == "focused" and "[CP-DEBUG][focus]" not in msg:
         return
     only_tag = os.environ.get("UNSLOTH_CP_DEBUG_ONLY_TAG")
+    if only_tag is None:
+        default_loss_only = os.environ.get("UNSLOTH_CP_DEBUG_ONLY_LOSS_N_ITEMS", "1")
+        if default_loss_only == "1":
+            only_tag = "[CP-DEBUG][loss-n_items]"
     if only_tag and only_tag not in msg:
         return
     print(msg, flush = True)
