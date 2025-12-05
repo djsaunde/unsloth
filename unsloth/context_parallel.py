@@ -811,14 +811,15 @@ def _patch_sft_trainer(trl_module) -> None:
         # when there's no data parallelism anyway.
         if manager and manager.enabled and manager.data_parallel_world_size == 1:
             try:
-                from transformers.training_args import ParallelMode
+                from accelerate.utils import DistributedType
 
                 args = getattr(self, "args", None)
+                distributed_state = getattr(args, "distributed_state", None)
                 if (
-                    args is not None
-                    and getattr(args, "parallel_mode", None) == ParallelMode.DISTRIBUTED
+                    distributed_state is not None
+                    and distributed_state.distributed_type == DistributedType.MULTI_GPU
                 ):
-                    args.parallel_mode = ParallelMode.NOT_DISTRIBUTED
+                    distributed_state.distributed_type = DistributedType.NO
                     if int(os.environ.get("RANK", "0")) == 0:
                         print(
                             "Context parallelism: disabled DDP for pure CP mode "
