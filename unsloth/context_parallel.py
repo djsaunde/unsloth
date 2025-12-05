@@ -806,29 +806,24 @@ def _patch_sft_trainer(trl_module) -> None:
         ):
             setattr(accelerator.state, "device_mesh", mesh)
 
-        # Enable sync_each_batch to keep the computation graph constant for
-        # static_graph mode. This is needed for gradient checkpointing + DDP +
-        # gradient accumulation to work together.
+        # Enable sync_each_batch when using CP with gradient accumulation.
+        # This keeps the computation graph constant for DDP + static_graph mode,
+        # which is required for gradient checkpointing compatibility.
         if (
             manager
             and manager.enabled
             and accelerator is not None
             and hasattr(accelerator, "gradient_state")
         ):
-            args = getattr(self, "args", None)
-            # Check training args since model.is_gradient_checkpointing isn't set yet
-            # Also check use_gradient_checkpointing for unsloth compatibility
-            is_checkpointing = getattr(args, "gradient_checkpointing", False)
-            use_gc = getattr(args, "use_gradient_checkpointing", None)
-            if use_gc and use_gc != "false":
-                is_checkpointing = True
-            grad_accum_steps = getattr(args, "gradient_accumulation_steps", 1)
-            if is_checkpointing and grad_accum_steps > 1:
+            grad_accum_steps = getattr(
+                getattr(self, "args", None), "gradient_accumulation_steps", 1
+            )
+            if grad_accum_steps > 1:
                 accelerator.gradient_state.plugin_kwargs["sync_each_batch"] = True
                 if int(os.environ.get("RANK", "0")) == 0:
                     print(
                         "Context parallelism: enabled sync_each_batch for gradient "
-                        "checkpointing + gradient accumulation compatibility."
+                        "accumulation compatibility (syncing gradients every batch)."
                     )
 
     def _maybe_enable_ddp_static_graph(trainer):
@@ -975,13 +970,50 @@ def _patch_sft_trainer(trl_module) -> None:
                 **kwargs,
             )
 
+    def _maybe_enable_sync_each_batch(trainer):
+        """Enable sync_each_batch at runtime if gradient checkpointing is detected."""
+        if getattr(trainer, "_sync_each_batch_checked", False):
+            return
+        setattr(trainer, "_sync_each_batch_checked", True)
+
+        accelerator = getattr(trainer, "accelerator", None)
+        if accelerator is None or not hasattr(accelerator, "gradient_state"):
+            return
+
+        # Check if already enabled
+        if accelerator.gradient_state.plugin_kwargs.get("sync_each_batch", False):
+            return
+
+        model = getattr(trainer, "model", None)
+        is_checkpointing = getattr(model, "is_gradient_checkpointing", False)
+        grad_accum_steps = getattr(trainer.args, "gradient_accumulation_steps", 1)
+
+        if is_checkpointing and grad_accum_steps > 1:
+            accelerator.gradient_state.plugin_kwargs["sync_each_batch"] = True
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    "Context parallelism: enabled sync_each_batch for gradient "
+                    "checkpointing + gradient accumulation compatibility."
+                )
+
     @functools.wraps(original_training_step)
     def patched_training_step(self, *args, **kwargs):
         manager = getattr(self, "_context_parallel_manager", None)
         original_n_gpu = getattr(self.args, "n_gpu", 1)
         if manager:
             setattr(self.args, "_n_gpu", manager.data_parallel_world_size)
-            _maybe_enable_ddp_static_graph(self)
+            _maybe_enable_sync_each_batch(self)
+            # Only enable static_graph if sync_each_batch is confirmed enabled
+            # (graph must be constant for static_graph to work)
+            accelerator = getattr(self, "accelerator", None)
+            if (
+                accelerator
+                and hasattr(accelerator, "gradient_state")
+                and accelerator.gradient_state.plugin_kwargs.get(
+                    "sync_each_batch", False
+                )
+            ):
+                _maybe_enable_ddp_static_graph(self)
         try:
             loss = original_training_step(self, *args, **kwargs)
         finally:
