@@ -956,7 +956,8 @@ def _patch_sft_trainer(trl_module) -> None:
         original_n_gpu = getattr(self.args, "n_gpu", 1)
         if manager:
             setattr(self.args, "_n_gpu", manager.data_parallel_world_size)
-            _maybe_enable_ddp_static_graph(self)
+            # Disabled: static graph mode conflicts with gradient accumulation
+            # _maybe_enable_ddp_static_graph(self)
         try:
             loss = original_training_step(self, *args, **kwargs)
         finally:
