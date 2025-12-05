@@ -508,21 +508,17 @@ class ContextParallelManager:
         return None
 
     def _adjust_num_items_in_batch(self, inputs: dict[str, torch.Tensor]) -> None:
+        # NOTE: We intentionally do NOT modify num_items_in_batch here.
+        # num_items_in_batch is used by the model for loss scaling and should
+        # remain the global token count across all CP ranks, not the local slice.
+        # The loss reduction in reduce_loss() handles the proper averaging.
+        self._cached_num_items = None
         if not self.enabled or "num_items_in_batch" not in inputs:
-            self._cached_num_items = None
             return
-        local_tokens = self._local_valid_token_count(inputs)
-        if local_tokens is None:
-            self._cached_num_items = None
-            return
-        value = inputs["num_items_in_batch"]
-        if torch.is_tensor(value):
-            local_tokens = local_tokens.to(device = value.device, dtype = value.dtype)
-            inputs["num_items_in_batch"] = local_tokens
-            self._cached_num_items = local_tokens
-        else:
-            self._cached_num_items = local_tokens.item()
-            inputs["num_items_in_batch"] = self._cached_num_items
+        # Just cache the value for potential debugging, don't modify it
+        value = inputs.get("num_items_in_batch")
+        if value is not None:
+            self._cached_num_items = value.item() if torch.is_tensor(value) else value
 
     def consume_num_items_override(self):
         value = self._cached_num_items
