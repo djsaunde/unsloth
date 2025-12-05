@@ -1108,4 +1108,7 @@ def _cp_debug(msg: str) -> None:
         return
     if mode == "focused" and "[CP-DEBUG][focus]" not in msg:
         return
+    only_tag = os.environ.get("UNSLOTH_CP_DEBUG_ONLY_TAG")
+    if only_tag and only_tag not in msg:
+        return
     print(msg, flush = True)
