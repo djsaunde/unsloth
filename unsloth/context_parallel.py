@@ -809,17 +809,19 @@ def _patch_sft_trainer(trl_module) -> None:
         # Enable sync_each_batch to keep the computation graph constant for
         # static_graph mode. This is needed for gradient checkpointing + DDP +
         # gradient accumulation to work together.
+        # Enable sync_each_batch to keep the computation graph constant for
+        # static_graph mode. This is needed for gradient checkpointing + DDP +
+        # gradient accumulation to work together.
         if (
             manager
             and manager.enabled
             and accelerator is not None
             and hasattr(accelerator, "gradient_state")
         ):
-            model = getattr(self, "model", None)
-            is_checkpointing = getattr(model, "is_gradient_checkpointing", False)
-            grad_accum_steps = getattr(
-                getattr(self, "args", None), "gradient_accumulation_steps", 1
-            )
+            args = getattr(self, "args", None)
+            # Check training args since model.is_gradient_checkpointing isn't set yet
+            is_checkpointing = getattr(args, "gradient_checkpointing", False)
+            grad_accum_steps = getattr(args, "gradient_accumulation_steps", 1)
             if is_checkpointing and grad_accum_steps > 1:
                 accelerator.gradient_state.plugin_kwargs["sync_each_batch"] = True
                 if int(os.environ.get("RANK", "0")) == 0:
