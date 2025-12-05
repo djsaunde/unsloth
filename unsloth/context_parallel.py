@@ -806,6 +806,28 @@ def _patch_sft_trainer(trl_module) -> None:
         ):
             setattr(accelerator.state, "device_mesh", mesh)
 
+        # Enable sync_each_batch to keep the computation graph constant for
+        # static_graph mode. This is needed for gradient checkpointing + DDP +
+        # gradient accumulation to work together.
+        if (
+            manager
+            and manager.enabled
+            and accelerator is not None
+            and hasattr(accelerator, "gradient_state")
+        ):
+            model = getattr(self, "model", None)
+            is_checkpointing = getattr(model, "is_gradient_checkpointing", False)
+            grad_accum_steps = getattr(
+                getattr(self, "args", None), "gradient_accumulation_steps", 1
+            )
+            if is_checkpointing and grad_accum_steps > 1:
+                accelerator.gradient_state.plugin_kwargs["sync_each_batch"] = True
+                if int(os.environ.get("RANK", "0")) == 0:
+                    print(
+                        "Context parallelism: enabled sync_each_batch for gradient "
+                        "checkpointing + gradient accumulation compatibility."
+                    )
+
     def _maybe_enable_ddp_static_graph(trainer):
         ddp_model = getattr(trainer, "model_wrapped", None)
         enable_fn = getattr(ddp_model, "_set_static_graph", None)
@@ -956,8 +978,7 @@ def _patch_sft_trainer(trl_module) -> None:
         original_n_gpu = getattr(self.args, "n_gpu", 1)
         if manager:
             setattr(self.args, "_n_gpu", manager.data_parallel_world_size)
-            # Disabled: static graph mode conflicts with gradient accumulation
-            # _maybe_enable_ddp_static_graph(self)
+            _maybe_enable_ddp_static_graph(self)
         try:
             loss = original_training_step(self, *args, **kwargs)
         finally:
