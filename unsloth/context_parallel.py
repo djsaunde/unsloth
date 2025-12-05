@@ -806,12 +806,33 @@ def _patch_sft_trainer(trl_module) -> None:
         ):
             setattr(accelerator.state, "device_mesh", mesh)
 
-        # Enable sync_each_batch when using CP with gradient accumulation.
-        # This keeps the computation graph constant for DDP + static_graph mode,
-        # which is required for gradient checkpointing compatibility.
+        # When using pure context parallelism (dp_world_size=1), disable DDP
+        # to avoid gradient checkpointing compatibility issues. DDP is not needed
+        # when there's no data parallelism anyway.
+        if manager and manager.enabled and manager.data_parallel_world_size == 1:
+            try:
+                from transformers.training_args import ParallelMode
+
+                args = getattr(self, "args", None)
+                if (
+                    args is not None
+                    and getattr(args, "parallel_mode", None) == ParallelMode.DISTRIBUTED
+                ):
+                    args.parallel_mode = ParallelMode.NOT_DISTRIBUTED
+                    if int(os.environ.get("RANK", "0")) == 0:
+                        print(
+                            "Context parallelism: disabled DDP for pure CP mode "
+                            "(dp_world_size=1, no data parallelism needed)."
+                        )
+            except ImportError:
+                pass
+
+        # Enable sync_each_batch when using CP with gradient accumulation and DDP.
+        # This keeps the computation graph constant for DDP + static_graph mode.
         if (
             manager
             and manager.enabled
+            and manager.data_parallel_world_size > 1  # Only needed with actual DP
             and accelerator is not None
             and hasattr(accelerator, "gradient_state")
         ):
