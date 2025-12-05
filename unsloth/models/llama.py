@@ -2188,6 +2188,15 @@ def CausalLM_fast_forward(fast_forward_inference):
 
                 if self.config.model_type == "falcon_h1":
                     hidden_states = hidden_states * self.config.lm_head_multiplier
+                if _cp_debug_enabled() and torch.is_tensor(labels):
+                    local_valid_tokens = labels.ne(-100).sum().item()
+                    n_items_value = (
+                        n_items.item() if torch.is_tensor(n_items) else n_items
+                    )
+                    _cp_debug(
+                        "[CP-DEBUG][loss-n_items] "
+                        f"n_items={n_items_value} local_valid_tokens={local_valid_tokens}"
+                    )
                 if _cp_debug_enabled() and torch.is_tensor(hidden_states):
                     manager = get_active_context_parallel_manager()
                     seq_dim = 1 if hidden_states.ndim > 1 else 0
@@ -2302,6 +2311,13 @@ def CausalLM_fast_forward(fast_forward_inference):
             n_items = kwargs.get("num_items_in_batch", None)
             if n_items is None:
                 n_items = kwargs.get("n_items", None)
+            if _cp_debug_enabled() and torch.is_tensor(loss_shift_labels):
+                local_valid_tokens = loss_shift_labels.ne(-100).sum().item()
+                n_items_value = n_items.item() if torch.is_tensor(n_items) else n_items
+                _cp_debug(
+                    "[CP-DEBUG][loss-n_items] "
+                    f"n_items={n_items_value} local_valid_tokens={local_valid_tokens}"
+                )
             if _cp_debug_enabled() and torch.is_tensor(shift_logits):
                 manager = get_active_context_parallel_manager()
                 seq_dim = 1 if shift_logits.ndim > 1 else 0
