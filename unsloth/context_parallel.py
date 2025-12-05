@@ -11,6 +11,7 @@ import contextvars
 import hashlib
 
 import torch
+import torch.nn.functional as F
 from packaging.version import Version
 import torch.distributed as dist
 
@@ -75,6 +76,7 @@ class ContextParallelSettings:
             "attention_mask",
             "labels",
             "position_ids",
+            "shift_labels",
         ),
         metadata = {
             "help": (
@@ -84,11 +86,18 @@ class ContextParallelSettings:
         },
     )
     no_restore_buffer_names: Tuple[str, ...] = field(
-        default_factory = lambda: ("position_ids",),
+        default_factory = lambda: (
+            "input_ids",
+            "attention_mask",
+            "labels",
+            "position_ids",
+            "shift_labels",
+        ),
         metadata = {
             "help": (
                 "Subset of `buffer_names` that do not need to be restored after the "
-                "context parallel region exits."
+                "context parallel region exits. For context parallelism with load "
+                "balancing, all buffers should remain sharded."
             )
         },
     )
@@ -113,17 +122,31 @@ class ContextParallelSettings:
         buffer_names = _as_tuple(
             _get(
                 "context_parallel_buffer_names",
-                ("input_ids", "attention_mask", "labels", "position_ids"),
+                (
+                    "input_ids",
+                    "attention_mask",
+                    "labels",
+                    "position_ids",
+                    "shift_labels",
+                ),
             )
         )
         buffer_names = _ensure_tuple_contains(buffer_names, "position_ids")
+        buffer_names = _ensure_tuple_contains(buffer_names, "shift_labels")
         no_restore = _as_tuple(
             _get(
                 "context_parallel_no_restore",
-                ("position_ids",),
+                (
+                    "input_ids",
+                    "attention_mask",
+                    "labels",
+                    "position_ids",
+                    "shift_labels",
+                ),
             )
         )
         no_restore = _ensure_tuple_contains(no_restore, "position_ids")
+        no_restore = _ensure_tuple_contains(no_restore, "shift_labels")
         return cls(
             size = size,
             seq_dim = seq_dim,
@@ -316,6 +339,41 @@ class ContextParallelManager:
                 f"[CP-DEBUG][cp-rank={self._cp_rank_index}] synthesized position_ids preview={preview}"
             )
 
+    def _ensure_shift_labels(self, inputs: dict[str, torch.Tensor]) -> None:
+        """
+        Create pre-shifted labels for context parallelism with load balancing.
+
+        With load balancing, tokens are reordered across ranks. The standard causal LM
+        loss shifts labels locally (labels[1:]), but this doesn't work with reordered
+        tokens. Instead, we pre-shift labels globally before sharding:
+          - Pad labels with -100 at the end: [l0, l1, ..., l199, -100]
+          - Take [1:]: [l1, l2, ..., l199, -100]
+
+        After sharding with load balancing, each rank gets the correct "next token"
+        labels for its positions, enabling proper loss computation without local shifting.
+        """
+        if not self.enabled:
+            return
+        if isinstance(inputs.get("shift_labels"), torch.Tensor):
+            return
+        labels = inputs.get("labels")
+        if not isinstance(labels, torch.Tensor):
+            return
+        if labels.ndim <= self.settings.seq_dim:
+            return
+        # Pad labels with -100 at the end, then take [1:] to get shifted labels
+        # This matches transformers' approach in _prepare_context_parallel_inputs
+        ignore_index = -100
+        # Pad on the sequence dimension (last dim for 2D labels)
+        padded = F.pad(labels, (0, 1), value = ignore_index)
+        shift_labels = padded[:, 1:].contiguous()
+        inputs["shift_labels"] = shift_labels
+        if _cp_debug_enabled():
+            preview = shift_labels.flatten().tolist()[: min(16, shift_labels.numel())]
+            _cp_debug(
+                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] synthesized shift_labels preview={preview}"
+            )
+
     def _debug_validate_buffers(
         self,
         buffers: list[torch.Tensor],
@@ -358,6 +416,7 @@ class ContextParallelManager:
                 return
             self._adjust_num_items_in_batch(inputs)
             self._ensure_position_ids(inputs)
+            self._ensure_shift_labels(inputs)
             buffers, seq_dims, no_restore = self._collect_buffers(inputs)
             self._debug_validate_buffers(buffers)
             if not buffers:
@@ -787,13 +846,57 @@ def _patch_sft_trainer(trl_module) -> None:
                 _cp_debug(
                     f"[CP-DEBUG][rank={rank}] before loss input_ids shape={getattr(ids, 'shape', None)} preview={preview}"
                 )
-            loss = original_compute_loss(
-                self,
-                model,
-                inputs,
-                return_outputs = return_outputs,
-                **kwargs,
+
+            # For context parallelism with shift_labels, compute loss externally
+            # to handle load-balanced token distribution correctly
+            shift_labels = inputs.get("shift_labels")
+            use_external_loss = (
+                manager and manager.enabled and isinstance(shift_labels, torch.Tensor)
             )
+
+            if use_external_loss:
+                # Remove labels so model doesn't compute loss internally
+                saved_labels = inputs.pop("labels", None)
+                # Also remove shift_labels from inputs (model doesn't need it)
+                inputs.pop("shift_labels", None)
+
+                # Get model outputs (logits only, no loss)
+                outputs = model(**inputs)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+
+                # Compute loss using pre-shifted labels
+                # No additional shifting needed - shift_labels already contains
+                # the correct "next token" for each position after sharding
+                from torch.nn import CrossEntropyLoss
+
+                loss_fct = CrossEntropyLoss()
+                # Flatten for loss computation
+                vocab_size = logits.size(-1)
+                loss = loss_fct(
+                    logits.view(-1, vocab_size),
+                    shift_labels.view(-1),
+                )
+
+                if _cp_debug_enabled():
+                    _cp_debug(
+                        f"[CP-DEBUG][focus][rank={rank}] external loss: logits shape={logits.shape} "
+                        f"shift_labels shape={shift_labels.shape} loss={loss.item()}"
+                    )
+
+                # Restore labels for reduce_loss token counting
+                if saved_labels is not None:
+                    inputs["labels"] = saved_labels
+
+                if return_outputs:
+                    loss = (loss, outputs)
+            else:
+                loss = original_compute_loss(
+                    self,
+                    model,
+                    inputs,
+                    return_outputs = return_outputs,
+                    **kwargs,
+                )
         if _cp_debug_enabled():
             _cp_debug(f"[CP-DEBUG][rank={rank}] raw loss={loss}")
         if manager:
