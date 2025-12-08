@@ -19,10 +19,16 @@ try:
     from torch.distributed.tensor.experimental import context_parallel
     from torch.distributed.tensor import DeviceMesh
 
-    # Disable load balancing in context parallel to debug divergence
-    from torch.distributed.tensor.experimental._attention import _cp_options
+    try:
+        # Allow overriding load balance via env (default True matches PyTorch)
+        from torch.distributed.tensor.experimental._attention import _cp_options
 
-    _cp_options.enable_load_balance = False
+        env_lb = os.environ.get("UNSLOTH_CP_LB")
+        if env_lb is not None:
+            _cp_options.enable_load_balance = env_lb not in ("0", "false", "False")
+    except Exception:
+        pass
+
 except (ImportError, AttributeError):
     context_parallel = None
     DeviceMesh = None
@@ -1107,12 +1113,5 @@ def _cp_debug(msg: str) -> None:
     if mode == "off":
         return
     if mode == "focused" and "[CP-DEBUG][focus]" not in msg:
-        return
-    only_tag = os.environ.get("UNSLOTH_CP_DEBUG_ONLY_TAG")
-    if only_tag is None:
-        default_loss_only = os.environ.get("UNSLOTH_CP_DEBUG_ONLY_LOSS_N_ITEMS", "1")
-        if default_loss_only == "1":
-            only_tag = "[CP-DEBUG][loss-n_items]"
-    if only_tag and only_tag not in msg:
         return
     print(msg, flush = True)
