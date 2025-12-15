@@ -110,6 +110,36 @@ def run(args):
     dataset = dataset.map(formatting_prompts_func, batched = True)
     print("Data is formatted and ready!")
 
+    # Freeze vision encoder if VLM + text-only dataset (fixes DDP unused params issue)
+    if distributed:
+
+        def is_vlm(m):
+            """Check if model has vision components."""
+            for name, _ in m.named_modules():
+                if any(
+                    v in name.lower()
+                    for v in ("visual", "vision", "image_encoder", "img_encoder")
+                ):
+                    return True
+            return False
+
+        def has_images(ds):
+            """Check if dataset has image columns."""
+            image_columns = {"image", "images", "pixel_values", "pixel_values_videos"}
+            return bool(image_columns & set(ds.column_names))
+
+        if is_vlm(model) and not has_images(dataset):
+            frozen_count = 0
+            for name, param in model.named_parameters():
+                if any(v in name.lower() for v in ("visual", "vision")):
+                    if param.requires_grad:
+                        param.requires_grad = False
+                        frozen_count += 1
+            if frozen_count > 0:
+                print(
+                    f"Unsloth: Froze {frozen_count} vision encoder params (text-only dataset + DDP)"
+                )
+
     # Configure training arguments
     training_args = SFTConfig(
         per_device_train_batch_size = args.per_device_train_batch_size,
