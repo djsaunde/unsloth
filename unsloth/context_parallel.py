@@ -519,22 +519,31 @@ class ContextParallelManager:
         return None
 
     def _adjust_num_items_in_batch(self, inputs: dict[str, torch.Tensor]) -> None:
-        # NOTE: We intentionally do NOT modify num_items_in_batch here.
-        # num_items_in_batch is used by the model for loss scaling and should
-        # remain the global token count across all CP ranks, not the local slice.
-        # The loss reduction in reduce_loss() handles the proper averaging.
+        # Remove num_items_in_batch so the model computes loss using LOCAL token count.
+        #
+        # With context parallelism, each rank has a shard of the sequence. If we pass
+        # the GLOBAL num_items_in_batch, the model computes: loss = local_sum / global_count
+        # Then reduce_loss tries to recover: scaled = loss * local_count, but this gives:
+        #   (local_sum / global_count) * local_count ≠ local_sum
+        #
+        # By removing num_items_in_batch, the model computes: loss = local_sum / local_count
+        # Then reduce_loss correctly recovers: scaled = loss * local_count = local_sum
+        # And the final reduction: global_sum / global_count gives the correct result.
         self._cached_num_items = None
         if not self.enabled or "num_items_in_batch" not in inputs:
             return
-        # Just cache the value for potential debugging, don't modify it
+        # Cache the global value for debugging, then remove from inputs
         value = inputs.get("num_items_in_batch")
         if value is not None:
             self._cached_num_items = value.item() if torch.is_tensor(value) else value
+        # Remove so model uses local token count
+        inputs.pop("num_items_in_batch", None)
 
     def consume_num_items_override(self):
-        value = self._cached_num_items
+        # Don't return the cached value - we want the model to compute local token count
+        # The cached value is kept only for debugging purposes
         self._cached_num_items = None
-        return value
+        return None
 
     def _set_report_loss(self, value: torch.Tensor) -> None:
         self._report_loss = value.detach() if torch.is_tensor(value) else None
