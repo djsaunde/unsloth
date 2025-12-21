@@ -1224,6 +1224,18 @@ def LlamaAttention_fast_forward(
                     )
                 except Exception as e:
                     print(f"[CP-SDPA-DEBUG][rank={_rank}] TorchDispatchMode error: {e}")
+                # Check if Q, K, V are DTensors (required for ring attention)
+                try:
+                    from torch.distributed.tensor import DTensor
+
+                    _q_is_dtensor = isinstance(Q, DTensor)
+                    _k_is_dtensor = isinstance(K, DTensor)
+                    _v_is_dtensor = isinstance(V, DTensor)
+                    print(
+                        f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] Q is DTensor: {_q_is_dtensor}, K is DTensor: {_k_is_dtensor}, V is DTensor: {_v_is_dtensor}"
+                    )
+                except Exception as e:
+                    print(f"[CP-SDPA-DEBUG][rank={_rank}] DTensor check error: {e}")
             # IMPORTANT: When context parallelism is active, we must use
             # torch.nn.functional.scaled_dot_product_attention directly (not through F)
             # because context_parallel monkey-patches the function on the module,
@@ -1233,6 +1245,14 @@ def LlamaAttention_fast_forward(
                 if cp_active
                 else F.scaled_dot_product_attention
             )
+            if _sdpa_debug or _sanity_check_layer0:
+                print(
+                    f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] Calling SDPA fn: {_sdpa_fn.__name__} from {_sdpa_fn.__module__}"
+                )
+                if hasattr(_sdpa_fn, "__closure__") and _sdpa_fn.__closure__:
+                    print(
+                        f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] SDPA fn has closure with {len(_sdpa_fn.__closure__)} cells"
+                    )
             A = _sdpa_fn(
                 Q,
                 K,
