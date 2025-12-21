@@ -107,6 +107,9 @@ def _run_cp_sanity_check(model, manager) -> None:
             f"[CP-SANITY][rank={rank}] Passing full input shape={tuple(test_input.shape)} to context_parallel"
         )
 
+        # Set the global seq_len so position_ids adjustment in the model works correctly
+        manager._last_global_seq_len = seq_len
+
         with context_parallel(
             manager._mesh,
             buffers = buffers,
