@@ -1369,6 +1369,17 @@ def _patch_sft_trainer(trl_module) -> None:
             _cp_debug(f"[CP-DEBUG][rank={rank}] raw loss={loss}")
         if manager:
             loss = manager.reduce_loss(loss, inputs)
+            # With CP, we remove num_items_in_batch, causing training_step to divide
+            # loss by gradient_accumulation_steps. Pre-multiply to counter this,
+            # ensuring correct loss scaling with gradient accumulation.
+            ga_steps = getattr(
+                getattr(self, "args", None), "gradient_accumulation_steps", 1
+            )
+            if ga_steps > 1:
+                if isinstance(loss, tuple):
+                    loss = (loss[0] * ga_steps,) + loss[1:]
+                elif torch.is_tensor(loss):
+                    loss = loss * ga_steps
         if _cp_debug_enabled():
             _cp_debug(f"[CP-DEBUG][rank={rank}] reduced loss={loss}")
         return loss
