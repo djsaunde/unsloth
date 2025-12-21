@@ -98,6 +98,17 @@ def _run_cp_sanity_check(model, manager) -> None:
 
             return hook
 
+        def make_pre_hook(name, storage):
+            def hook(module, input):
+                if isinstance(input, tuple) and len(input) > 0:
+                    inp = input[0]
+                else:
+                    inp = input
+                if isinstance(inp, torch.Tensor):
+                    storage[name] = inp.detach().clone()
+
+            return hook
+
         # Register hooks on first few layers
         hooks = []
         # Navigate to the inner model (handles PEFT wrapping, etc.)
@@ -133,6 +144,11 @@ def _run_cp_sanity_check(model, manager) -> None:
             )
             # Also hook the attention module inside layer 0
             if hasattr(base_model.layers[0], "self_attn"):
+                hooks.append(
+                    base_model.layers[0].self_attn.register_forward_pre_hook(
+                        make_pre_hook("layer0_attn_in", layer_outputs_ref)
+                    )
+                )
                 hooks.append(
                     base_model.layers[0].self_attn.register_forward_hook(
                         make_hook("layer0_attn", layer_outputs_ref)
@@ -247,6 +263,11 @@ def _run_cp_sanity_check(model, manager) -> None:
                     )
                     # Also hook the attention module inside layer 0
                     if hasattr(base_model.layers[0], "self_attn"):
+                        hooks_cp.append(
+                            base_model.layers[0].self_attn.register_forward_pre_hook(
+                                make_pre_hook("layer0_attn_in", layer_outputs_cp)
+                            )
+                        )
                         hooks_cp.append(
                             base_model.layers[0].self_attn.register_forward_hook(
                                 make_hook("layer0_attn", layer_outputs_cp)
