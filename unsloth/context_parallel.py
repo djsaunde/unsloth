@@ -85,10 +85,51 @@ def _run_cp_sanity_check(model, manager) -> None:
 
     model.eval()
     with torch.no_grad():
+        # Capture layer outputs for debugging
+        layer_outputs_ref = {}
+
+        def make_hook(name, storage):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    out = output[0]
+                else:
+                    out = output
+                storage[name] = out.detach().clone()
+
+            return hook
+
+        # Register hooks on first few layers
+        hooks = []
+        base_model = model.model if hasattr(model, "model") else model
+        if hasattr(base_model, "embed_tokens"):
+            hooks.append(
+                base_model.embed_tokens.register_forward_hook(
+                    make_hook("embed", layer_outputs_ref)
+                )
+            )
+        if hasattr(base_model, "layers") and len(base_model.layers) > 0:
+            hooks.append(
+                base_model.layers[0].register_forward_hook(
+                    make_hook("layer0", layer_outputs_ref)
+                )
+            )
+
         ref_output = model(test_input, position_ids = full_pos.clone())
         ref_logits = ref_output.logits
         ref_sum = ref_logits.sum().item()
         ref_first = ref_logits[0, 0, :5].tolist()
+
+        # Remove hooks
+        for h in hooks:
+            h.remove()
+
+        # Log reference layer checksums
+        for name, tensor in layer_outputs_ref.items():
+            checksum = tensor.float().sum().item()
+            print(
+                f"[CP-SANITY][rank={rank}] REF {name}: shape={tuple(tensor.shape)} checksum={checksum:.4f}"
+            )
+
         print(
             f"[CP-SANITY][rank={rank}] Reference (no CP, SDPA): logits_sum={ref_sum:.4f} first_5={[f'{x:.4f}' for x in ref_first]}"
         )
@@ -152,9 +193,49 @@ def _run_cp_sanity_check(model, manager) -> None:
                 print(
                     f"[CP-SANITY][rank={rank}] cp_active check: manager.enabled={manager.enabled}"
                 )
+
+                # Register hooks for CP run
+                layer_outputs_cp = {}
+                hooks_cp = []
+                if hasattr(base_model, "embed_tokens"):
+                    hooks_cp.append(
+                        base_model.embed_tokens.register_forward_hook(
+                            make_hook("embed", layer_outputs_cp)
+                        )
+                    )
+                if hasattr(base_model, "layers") and len(base_model.layers) > 0:
+                    hooks_cp.append(
+                        base_model.layers[0].register_forward_hook(
+                            make_hook("layer0", layer_outputs_cp)
+                        )
+                    )
+
                 cp_output = model(input_ids = test_input, position_ids = full_pos)
                 cp_logits = cp_output.logits
                 local_sum = cp_logits.sum()
+
+                # Remove hooks
+                for h in hooks_cp:
+                    h.remove()
+
+                # Log CP layer checksums and compare with reference
+                for name, tensor in layer_outputs_cp.items():
+                    local_checksum = tensor.float().sum()
+                    # Gather checksums from all ranks
+                    all_checksums = [
+                        torch.zeros_like(local_checksum) for _ in range(world_size)
+                    ]
+                    dist.all_gather(all_checksums, local_checksum)
+                    total_checksum = sum(c.item() for c in all_checksums)
+                    ref_checksum = (
+                        layer_outputs_ref[name].float().sum().item()
+                        if name in layer_outputs_ref
+                        else 0
+                    )
+                    diff = abs(total_checksum - ref_checksum)
+                    print(
+                        f"[CP-SANITY][rank={rank}] CP {name}: local_shape={tuple(tensor.shape)} total_checksum={total_checksum:.4f} ref={ref_checksum:.4f} diff={diff:.4f}"
+                    )
                 print(
                     f"[CP-SANITY][rank={rank}] Model returned, logits shape={tuple(cp_logits.shape)}"
                 )
