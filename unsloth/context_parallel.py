@@ -72,20 +72,29 @@ def _run_cp_sanity_check(model, manager) -> None:
     )
 
     # Run model WITHOUT context parallel to get reference output
+    # Force SDPA path by temporarily disabling Flash Attention
+    # This ensures reference and CP runs use the same attention implementation
+    import unsloth.models.llama as llama_module
+
+    original_has_flash = getattr(llama_module, "HAS_FLASH_ATTENTION", False)
+    llama_module.HAS_FLASH_ATTENTION = False
+    print(f"[CP-SANITY][rank={rank}] Disabled Flash Attention for fair comparison")
+
+    # Create position_ids for reference too (ensures same RoPE code path)
+    full_pos = torch.arange(seq_len, device = "cuda").unsqueeze(0)
+
     model.eval()
     with torch.no_grad():
-        ref_output = model(test_input)
+        ref_output = model(test_input, position_ids = full_pos.clone())
         ref_logits = ref_output.logits
         ref_sum = ref_logits.sum().item()
         ref_first = ref_logits[0, 0, :5].tolist()
         print(
-            f"[CP-SANITY][rank={rank}] Reference (no CP): logits_sum={ref_sum:.4f} first_5={[f'{x:.4f}' for x in ref_first]}"
+            f"[CP-SANITY][rank={rank}] Reference (no CP, SDPA): logits_sum={ref_sum:.4f} first_5={[f'{x:.4f}' for x in ref_first]}"
         )
 
         # Now run WITH context parallel
         # DON'T manually shard - let context_parallel do it!
-        # Create full position_ids
-        full_pos = torch.arange(seq_len, device = "cuda").unsqueeze(0)
 
         # Check if model is compiled (torch.compile can bypass TorchFunctionMode)
         is_compiled = hasattr(model, "_orig_mod") or hasattr(model, "__wrapped__")
@@ -165,6 +174,9 @@ def _run_cp_sanity_check(model, manager) -> None:
                     print(
                         f"[CP-SANITY][rank={rank}] This indicates ring attention may not be working correctly"
                     )
+
+    # Restore Flash Attention flag
+    llama_module.HAS_FLASH_ATTENTION = original_has_flash
 
     model.train()
     dist.barrier()
