@@ -98,15 +98,34 @@ def _run_cp_sanity_check(model, manager) -> None:
         # Run with the CP context
         inputs_dict = {"input_ids": local_input, "position_ids": local_pos}
         buffers = [local_input, local_pos]
+
+        # Check if model is compiled (torch.compile can bypass TorchFunctionMode)
+        is_compiled = hasattr(model, "_orig_mod") or hasattr(model, "__wrapped__")
+        print(f"[CP-SANITY][rank={rank}] Model is_compiled={is_compiled}")
+
+        # Try to detect if ring attention will be used
+        try:
+            from torch.distributed.tensor.experimental._attention import _cp_options
+
+            print(
+                f"[CP-SANITY][rank={rank}] CP options: enable_load_balance={_cp_options.enable_load_balance}"
+            )
+        except Exception as e:
+            print(f"[CP-SANITY][rank={rank}] Could not check CP options: {e}")
+
         with context_parallel(
             manager._mesh,
             buffers = buffers,
             buffer_seq_dims = [1, 1],
             no_restore_buffers = set(buffers),
         ):
+            print(f"[CP-SANITY][rank={rank}] Inside context_parallel, calling model...")
             cp_output = model(input_ids = local_input, position_ids = local_pos)
             cp_logits = cp_output.logits
             local_sum = cp_logits.sum()
+            print(
+                f"[CP-SANITY][rank={rank}] Model returned, logits shape={tuple(cp_logits.shape)}"
+            )
 
             # Gather sums from all ranks
             all_sums = [torch.zeros_like(local_sum) for _ in range(world_size)]

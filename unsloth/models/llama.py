@@ -1188,6 +1188,20 @@ def LlamaAttention_fast_forward(
         if SDPA_HAS_GQA:
             # Needs (batch_size, n_heads, seq_len, head_dim)
             # is_casual and attention_mask must not be both set!
+            # CP Debug: Check if ring attention should be active
+            if os.environ.get("UNSLOTH_CP_DEBUG_SDPA") == "1":
+                import torch.distributed as _dist
+
+                _rank = _dist.get_rank() if _dist.is_initialized() else 0
+                print(
+                    f"[CP-SDPA-DEBUG][rank={_rank}] SDPA call: Q={tuple(Q.shape)} K={tuple(K.shape)} V={tuple(V.shape)} is_causal={is_causal}"
+                )
+                # Check if context_parallel mode is active
+                from torch.overrides import get_default_nowrap_functions
+
+                print(
+                    f"[CP-SDPA-DEBUG][rank={_rank}] TorchFunctionMode stack depth: checking..."
+                )
             A = F.scaled_dot_product_attention(
                 Q,
                 K,
@@ -1196,6 +1210,8 @@ def LlamaAttention_fast_forward(
                 is_causal = is_causal,
                 enable_gqa = n_groups != 1,
             )
+            if os.environ.get("UNSLOTH_CP_DEBUG_SDPA") == "1":
+                print(f"[CP-SDPA-DEBUG][rank={_rank}] SDPA output: A={tuple(A.shape)}")
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2)  # .contiguous()
         else:
