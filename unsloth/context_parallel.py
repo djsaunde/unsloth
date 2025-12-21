@@ -117,6 +117,12 @@ def _run_cp_sanity_check(model, manager) -> None:
             print(
                 f"[CP-SANITY][rank={rank}] Inside context_parallel, input now shape={tuple(test_input.shape)}"
             )
+            print(
+                f"[CP-SANITY][rank={rank}] position_ids shape={tuple(full_pos.shape)} values={full_pos[0, :8].tolist()}...{full_pos[0, -4:].tolist()}"
+            )
+            print(
+                f"[CP-SANITY][rank={rank}] input_ids first 8: {test_input[0, :8].tolist()}"
+            )
             cp_output = model(input_ids = test_input, position_ids = full_pos)
             cp_logits = cp_output.logits
             local_sum = cp_logits.sum()
