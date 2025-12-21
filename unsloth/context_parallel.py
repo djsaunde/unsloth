@@ -49,6 +49,95 @@ def is_context_parallel_active() -> bool:
     return bool(manager and manager.enabled)
 
 
+def _run_cp_sanity_check(model, manager) -> None:
+    """
+    One-time sanity check to verify model outputs are consistent across CP ranks.
+    Run with UNSLOTH_CP_SANITY_CHECK=1 to enable.
+    """
+    if not dist.is_initialized():
+        return
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # Create identical test input on all ranks
+    torch.manual_seed(42)
+    seq_len = 32 * manager.settings.size  # Ensure divisible by CP size
+    test_input = torch.randint(100, 1000, (1, seq_len), device = "cuda")
+
+    # Broadcast from rank 0 to ensure identical input
+    dist.broadcast(test_input, src = 0)
+
+    print(
+        f"[CP-SANITY][rank={rank}] Running sanity check with input shape {test_input.shape}"
+    )
+
+    # Run model WITHOUT context parallel to get reference output
+    model.eval()
+    with torch.no_grad():
+        ref_output = model(test_input)
+        ref_logits = ref_output.logits
+        ref_sum = ref_logits.sum().item()
+        ref_first = ref_logits[0, 0, :5].tolist()
+        print(
+            f"[CP-SANITY][rank={rank}] Reference (no CP): logits_sum={ref_sum:.4f} first_5={[f'{x:.4f}' for x in ref_first]}"
+        )
+
+        # Now run WITH context parallel
+        # Manually shard the input
+        chunk_size = seq_len // manager.settings.size
+        start = rank * chunk_size
+        local_input = test_input[:, start : start + chunk_size].contiguous()
+
+        # Create position_ids for the local chunk
+        local_pos = torch.arange(start, start + chunk_size, device = "cuda").unsqueeze(0)
+
+        print(
+            f"[CP-SANITY][rank={rank}] Local input: positions {start}-{start + chunk_size - 1}"
+        )
+
+        # Run with the CP context
+        inputs_dict = {"input_ids": local_input, "position_ids": local_pos}
+        buffers = [local_input, local_pos]
+        with context_parallel(
+            manager._mesh,
+            buffers = buffers,
+            buffer_seq_dims = [1, 1],
+            no_restore_buffers = set(buffers),
+        ):
+            cp_output = model(input_ids = local_input, position_ids = local_pos)
+            cp_logits = cp_output.logits
+            local_sum = cp_logits.sum()
+
+            # Gather sums from all ranks
+            all_sums = [torch.zeros_like(local_sum) for _ in range(world_size)]
+            dist.all_gather(all_sums, local_sum)
+            cp_total_sum = sum(s.item() for s in all_sums)
+
+            print(
+                f"[CP-SANITY][rank={rank}] CP local logits_sum={local_sum.item():.4f}"
+            )
+            print(
+                f"[CP-SANITY][rank={rank}] CP total logits_sum={cp_total_sum:.4f} (ref={ref_sum:.4f})"
+            )
+
+            # Check if they match
+            diff = abs(cp_total_sum - ref_sum)
+            if diff < 0.01:
+                print(
+                    f"[CP-SANITY][rank={rank}] ✓ PASS: Outputs match (diff={diff:.6f})"
+                )
+            else:
+                print(
+                    f"[CP-SANITY][rank={rank}] ✗ FAIL: Outputs differ (diff={diff:.6f})"
+                )
+                print(
+                    f"[CP-SANITY][rank={rank}] This indicates ring attention may not be working correctly"
+                )
+
+    model.train()
+    dist.barrier()
+
+
 def _torch_version() -> Version:
     return Version(torch.__version__.split("+")[0])
 
@@ -919,6 +1008,20 @@ def _patch_sft_trainer(trl_module) -> None:
         if manager and manager.enabled:
             kwargs.pop("num_items_in_batch", None)
             inputs.pop("num_items_in_batch", None)
+
+        # One-time sanity check to verify model outputs match between CP and non-CP
+        if (
+            manager
+            and manager.enabled
+            and os.environ.get("UNSLOTH_CP_SANITY_CHECK") == "1"
+            and not getattr(manager, "_sanity_check_done", False)
+        ):
+            manager._sanity_check_done = True
+            try:
+                _run_cp_sanity_check(model, manager)
+            except Exception as e:
+                print(f"[CP-SANITY] Error running sanity check: {e}")
+
         if (
             manager
             and os.environ.get("UNSLOTH_CP_DUMP_BATCH") == "1"
