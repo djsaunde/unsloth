@@ -101,6 +101,11 @@ def _run_cp_sanity_check(model, manager) -> None:
         # Register hooks on first few layers
         hooks = []
         base_model = model.model if hasattr(model, "model") else model
+        print(f"[CP-SANITY][rank={rank}] base_model type: {type(base_model).__name__}")
+        print(
+            f"[CP-SANITY][rank={rank}] has embed_tokens: {hasattr(base_model, 'embed_tokens')}"
+        )
+        print(f"[CP-SANITY][rank={rank}] has layers: {hasattr(base_model, 'layers')}")
         if hasattr(base_model, "embed_tokens"):
             hooks.append(
                 base_model.embed_tokens.register_forward_hook(
@@ -113,6 +118,7 @@ def _run_cp_sanity_check(model, manager) -> None:
                     make_hook("layer0", layer_outputs_ref)
                 )
             )
+        print(f"[CP-SANITY][rank={rank}] Registered {len(hooks)} hooks")
 
         ref_output = model(test_input, position_ids = full_pos.clone())
         ref_logits = ref_output.logits
@@ -124,6 +130,9 @@ def _run_cp_sanity_check(model, manager) -> None:
             h.remove()
 
         # Log reference layer checksums
+        print(
+            f"[CP-SANITY][rank={rank}] layer_outputs_ref keys: {list(layer_outputs_ref.keys())}"
+        )
         for name, tensor in layer_outputs_ref.items():
             checksum = tensor.float().sum().item()
             print(
