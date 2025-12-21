@@ -440,8 +440,6 @@ class ContextParallelManager:
     def _ensure_position_ids(self, inputs: dict[str, torch.Tensor]) -> None:
         if not self.enabled:
             return
-        if isinstance(inputs.get("position_ids"), torch.Tensor):
-            return
         input_ids = inputs.get("input_ids")
         if not isinstance(input_ids, torch.Tensor):
             return
@@ -450,7 +448,11 @@ class ContextParallelManager:
         seq_len = input_ids.size(self.settings.seq_dim)
         if seq_len <= 0:
             return
+        # Always set _last_global_seq_len for position_ids adjustment in model
         self._last_global_seq_len = seq_len
+        # If position_ids already provided, don't synthesize new ones
+        if isinstance(inputs.get("position_ids"), torch.Tensor):
+            return
         device = input_ids.device
         dtype = torch.long
         base = torch.arange(seq_len, dtype = dtype, device = device)
