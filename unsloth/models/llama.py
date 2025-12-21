@@ -1265,6 +1265,34 @@ def LlamaAttention_fast_forward(
                 print(
                     f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] SDPA output: A={tuple(A.shape)}"
                 )
+                # Check if ring attention actually ran by computing what local-only attention would give
+                # If ring attention ran, the output should differ from local-only attention
+                if cp_active and _rank == 1 and A.shape[2] > 0:
+                    # Compute local-only attention for comparison
+                    with torch.no_grad():
+                        local_only_A = F.scaled_dot_product_attention(
+                            Q,
+                            K,
+                            V,
+                            attn_mask = attention_mask,
+                            is_causal = is_causal,
+                            enable_gqa = n_groups != 1,
+                        )
+                        # Compare first token's output (token 32 globally, which should attend to 0-32)
+                        ring_val = A[
+                            0, 0, 0, :4
+                        ].tolist()  # First 4 values of first token
+                        local_val = local_only_A[0, 0, 0, :4].tolist()
+                        diff = (A - local_only_A).abs().mean().item()
+                        print(
+                            f"[CP-RING-CHECK][rank={_rank}] ring_output[:4]={ring_val}"
+                        )
+                        print(
+                            f"[CP-RING-CHECK][rank={_rank}] local_output[:4]={local_val}"
+                        )
+                        print(
+                            f"[CP-RING-CHECK][rank={_rank}] mean_diff={diff:.6f} (should be >0 if ring attention ran)"
+                        )
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2)  # .contiguous()
         else:
