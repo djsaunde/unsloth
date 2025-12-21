@@ -567,6 +567,32 @@ class ContextParallelManager:
                 f"cp-rank={self._cp_rank_index}"
             )
 
+        # Enhanced CP Loss Debug
+        if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
+            loss_val = (
+                loss.item()
+                if torch.is_tensor(loss)
+                else (loss[0].item() if isinstance(loss, tuple) else loss)
+            )
+            shift_labels = inputs.get("shift_labels")
+            labels = inputs.get("labels")
+            sl_count = (
+                shift_labels.ne(-100).sum().item()
+                if torch.is_tensor(shift_labels)
+                else None
+            )
+            l_count = labels.ne(-100).sum().item() if torch.is_tensor(labels) else None
+            sl_shape = (
+                tuple(shift_labels.shape) if torch.is_tensor(shift_labels) else None
+            )
+            l_shape = tuple(labels.shape) if torch.is_tensor(labels) else None
+            print(
+                f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss ENTRY: "
+                f"raw_loss={loss_val:.6f} "
+                f"shift_labels_valid={sl_count} shift_labels_shape={sl_shape} "
+                f"labels_valid={l_count} labels_shape={l_shape}"
+            )
+
         def _reduce_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             if tensor is None or not torch.is_tensor(tensor):
                 zeros = torch.zeros(
@@ -632,6 +658,13 @@ class ContextParallelManager:
                 _cp_debug(
                     f"[CP-DEBUG][focus] reduce_loss _finalize: summed={summed.item()} tokens={tokens.item()} "
                     f"normalized={normalized.item()} cp-rank={self._cp_rank_index}"
+                )
+            # Enhanced CP Loss Debug
+            if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
+                print(
+                    f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss FINAL: "
+                    f"global_sum={summed.item():.6f} global_tokens={tokens.item():.1f} "
+                    f"normalized_loss={normalized.item():.6f}"
                 )
             return normalized
 
@@ -909,6 +942,34 @@ def _patch_sft_trainer(trl_module) -> None:
             rank = 0
             if dist.is_initialized():
                 rank = dist.get_rank()
+            # Enhanced CP Loss Debug
+            if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
+                num_items = kwargs.get("num_items_in_batch")
+                num_items_val = (
+                    num_items.item() if torch.is_tensor(num_items) else num_items
+                )
+                ids = inputs.get("input_ids")
+                labels = inputs.get("labels")
+                shift_labels = inputs.get("shift_labels")
+                ids_shape = tuple(ids.shape) if torch.is_tensor(ids) else None
+                labels_shape = tuple(labels.shape) if torch.is_tensor(labels) else None
+                sl_shape = (
+                    tuple(shift_labels.shape) if torch.is_tensor(shift_labels) else None
+                )
+                labels_valid = (
+                    labels.ne(-100).sum().item() if torch.is_tensor(labels) else None
+                )
+                sl_valid = (
+                    shift_labels.ne(-100).sum().item()
+                    if torch.is_tensor(shift_labels)
+                    else None
+                )
+                print(
+                    f"[CP-LOSS-DEBUG][rank={rank}] patched_compute_loss: "
+                    f"num_items_in_batch={num_items_val} "
+                    f"input_ids_shape={ids_shape} labels_shape={labels_shape} shift_labels_shape={sl_shape} "
+                    f"labels_valid={labels_valid} shift_labels_valid={sl_valid}"
+                )
             if _cp_debug_enabled():
                 ids = inputs.get("input_ids")
                 preview = (
