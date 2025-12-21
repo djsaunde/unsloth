@@ -83,21 +83,9 @@ def _run_cp_sanity_check(model, manager) -> None:
         )
 
         # Now run WITH context parallel
-        # Manually shard the input
-        chunk_size = seq_len // manager.settings.size
-        start = rank * chunk_size
-        local_input = test_input[:, start : start + chunk_size].contiguous()
-
-        # Create position_ids for the local chunk
-        local_pos = torch.arange(start, start + chunk_size, device = "cuda").unsqueeze(0)
-
-        print(
-            f"[CP-SANITY][rank={rank}] Local input: positions {start}-{start + chunk_size - 1}"
-        )
-
-        # Run with the CP context
-        inputs_dict = {"input_ids": local_input, "position_ids": local_pos}
-        buffers = [local_input, local_pos]
+        # DON'T manually shard - let context_parallel do it!
+        # Create full position_ids
+        full_pos = torch.arange(seq_len, device = "cuda").unsqueeze(0)
 
         # Check if model is compiled (torch.compile can bypass TorchFunctionMode)
         is_compiled = hasattr(model, "_orig_mod") or hasattr(model, "__wrapped__")
@@ -113,14 +101,23 @@ def _run_cp_sanity_check(model, manager) -> None:
         except Exception as e:
             print(f"[CP-SANITY][rank={rank}] Could not check CP options: {e}")
 
+        # Pass FULL tensors to context_parallel - it will shard them
+        buffers = [test_input, full_pos]
+        print(
+            f"[CP-SANITY][rank={rank}] Passing full input shape={tuple(test_input.shape)} to context_parallel"
+        )
+
         with context_parallel(
             manager._mesh,
             buffers = buffers,
             buffer_seq_dims = [1, 1],
             no_restore_buffers = set(buffers),
         ):
-            print(f"[CP-SANITY][rank={rank}] Inside context_parallel, calling model...")
-            cp_output = model(input_ids = local_input, position_ids = local_pos)
+            # After entering context, buffers are sharded in-place
+            print(
+                f"[CP-SANITY][rank={rank}] Inside context_parallel, input now shape={tuple(test_input.shape)}"
+            )
+            cp_output = model(input_ids = test_input, position_ids = full_pos)
             cp_logits = cp_output.logits
             local_sum = cp_logits.sum()
             print(
