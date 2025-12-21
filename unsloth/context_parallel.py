@@ -915,6 +915,10 @@ def _patch_sft_trainer(trl_module) -> None:
     @functools.wraps(original_compute_loss)
     def patched_compute_loss(self, model, inputs, return_outputs = False, **kwargs):
         manager = getattr(self, "_context_parallel_manager", None)
+        # Remove num_items_in_batch when CP is enabled - model should use local token count
+        if manager and manager.enabled:
+            kwargs.pop("num_items_in_batch", None)
+            inputs.pop("num_items_in_batch", None)
         if (
             manager
             and os.environ.get("UNSLOTH_CP_DUMP_BATCH") == "1"
