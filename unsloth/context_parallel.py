@@ -100,7 +100,20 @@ def _run_cp_sanity_check(model, manager) -> None:
 
         # Register hooks on first few layers
         hooks = []
-        base_model = model.model if hasattr(model, "model") else model
+        # Navigate to the inner model (handles PEFT wrapping, etc.)
+        base_model = model
+        print(f"[CP-SANITY][rank={rank}] model type: {type(model).__name__}")
+        if hasattr(model, "model"):
+            print(
+                f"[CP-SANITY][rank={rank}] model.model type: {type(model.model).__name__}"
+            )
+            if hasattr(model.model, "model"):
+                print(
+                    f"[CP-SANITY][rank={rank}] model.model.model type: {type(model.model.model).__name__}"
+                )
+                base_model = model.model.model
+            elif hasattr(model.model, "layers"):
+                base_model = model.model
         print(f"[CP-SANITY][rank={rank}] base_model type: {type(base_model).__name__}")
         print(
             f"[CP-SANITY][rank={rank}] has embed_tokens: {hasattr(base_model, 'embed_tokens')}"
