@@ -113,48 +113,55 @@ def _run_cp_sanity_check(model, manager) -> None:
             buffer_seq_dims = [1, 1],
             no_restore_buffers = set(buffers),
         ):
-            # After entering context, buffers are sharded in-place
-            print(
-                f"[CP-SANITY][rank={rank}] Inside context_parallel, input now shape={tuple(test_input.shape)}"
-            )
-            print(
-                f"[CP-SANITY][rank={rank}] position_ids shape={tuple(full_pos.shape)} values={full_pos[0, :8].tolist()}...{full_pos[0, -4:].tolist()}"
-            )
-            print(
-                f"[CP-SANITY][rank={rank}] input_ids first 8: {test_input[0, :8].tolist()}"
-            )
-            cp_output = model(input_ids = test_input, position_ids = full_pos)
-            cp_logits = cp_output.logits
-            local_sum = cp_logits.sum()
-            print(
-                f"[CP-SANITY][rank={rank}] Model returned, logits shape={tuple(cp_logits.shape)}"
-            )
-
-            # Gather sums from all ranks
-            all_sums = [torch.zeros_like(local_sum) for _ in range(world_size)]
-            dist.all_gather(all_sums, local_sum)
-            cp_total_sum = sum(s.item() for s in all_sums)
-
-            print(
-                f"[CP-SANITY][rank={rank}] CP local logits_sum={local_sum.item():.4f}"
-            )
-            print(
-                f"[CP-SANITY][rank={rank}] CP total logits_sum={cp_total_sum:.4f} (ref={ref_sum:.4f})"
-            )
-
-            # Check if they match
-            diff = abs(cp_total_sum - ref_sum)
-            if diff < 0.01:
+            # IMPORTANT: Also set unsloth's _ACTIVE_MANAGER so cp_active is True
+            # This ensures unsloth uses SDPA (which gets intercepted by ring attention)
+            # instead of Flash Attention (which would bypass ring attention).
+            with manager.replay_context():
+                # After entering context, buffers are sharded in-place
                 print(
-                    f"[CP-SANITY][rank={rank}] ✓ PASS: Outputs match (diff={diff:.6f})"
-                )
-            else:
-                print(
-                    f"[CP-SANITY][rank={rank}] ✗ FAIL: Outputs differ (diff={diff:.6f})"
+                    f"[CP-SANITY][rank={rank}] Inside context_parallel, input now shape={tuple(test_input.shape)}"
                 )
                 print(
-                    f"[CP-SANITY][rank={rank}] This indicates ring attention may not be working correctly"
+                    f"[CP-SANITY][rank={rank}] position_ids shape={tuple(full_pos.shape)} values={full_pos[0, :8].tolist()}...{full_pos[0, -4:].tolist()}"
                 )
+                print(
+                    f"[CP-SANITY][rank={rank}] input_ids first 8: {test_input[0, :8].tolist()}"
+                )
+                print(
+                    f"[CP-SANITY][rank={rank}] cp_active check: manager.enabled={manager.enabled}"
+                )
+                cp_output = model(input_ids = test_input, position_ids = full_pos)
+                cp_logits = cp_output.logits
+                local_sum = cp_logits.sum()
+                print(
+                    f"[CP-SANITY][rank={rank}] Model returned, logits shape={tuple(cp_logits.shape)}"
+                )
+
+                # Gather sums from all ranks
+                all_sums = [torch.zeros_like(local_sum) for _ in range(world_size)]
+                dist.all_gather(all_sums, local_sum)
+                cp_total_sum = sum(s.item() for s in all_sums)
+
+                print(
+                    f"[CP-SANITY][rank={rank}] CP local logits_sum={local_sum.item():.4f}"
+                )
+                print(
+                    f"[CP-SANITY][rank={rank}] CP total logits_sum={cp_total_sum:.4f} (ref={ref_sum:.4f})"
+                )
+
+                # Check if they match
+                diff = abs(cp_total_sum - ref_sum)
+                if diff < 0.01:
+                    print(
+                        f"[CP-SANITY][rank={rank}] ✓ PASS: Outputs match (diff={diff:.6f})"
+                    )
+                else:
+                    print(
+                        f"[CP-SANITY][rank={rank}] ✗ FAIL: Outputs differ (diff={diff:.6f})"
+                    )
+                    print(
+                        f"[CP-SANITY][rank={rank}] This indicates ring attention may not be working correctly"
+                    )
 
     model.train()
     dist.barrier()
