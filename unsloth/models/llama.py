@@ -1224,7 +1224,16 @@ def LlamaAttention_fast_forward(
                     )
                 except Exception as e:
                     print(f"[CP-SDPA-DEBUG][rank={_rank}] TorchDispatchMode error: {e}")
-            A = F.scaled_dot_product_attention(
+            # IMPORTANT: When context parallelism is active, we must use
+            # torch.nn.functional.scaled_dot_product_attention directly (not through F)
+            # because context_parallel monkey-patches the function on the module,
+            # but our cached F reference points to the original unpatched function.
+            _sdpa_fn = (
+                torch.nn.functional.scaled_dot_product_attention
+                if cp_active
+                else F.scaled_dot_product_attention
+            )
+            A = _sdpa_fn(
                 Q,
                 K,
                 V,
@@ -1254,9 +1263,13 @@ def LlamaAttention_fast_forward(
             Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
             # Needs (batch_size, n_heads, seq_len, head_dim)
             # is_casual and attention_mask must not be both set!
-            A = F.scaled_dot_product_attention(
-                Q, K, V, attn_mask = attention_mask, is_causal = is_causal
+            # Use module-level access for CP compatibility (see GQA path comment)
+            _sdpa_fn = (
+                torch.nn.functional.scaled_dot_product_attention
+                if cp_active
+                else F.scaled_dot_product_attention
             )
+            A = _sdpa_fn(Q, K, V, attn_mask = attention_mask, is_causal = is_causal)
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2).contiguous()
         pass
