@@ -131,6 +131,20 @@ def _run_cp_sanity_check(model, manager) -> None:
                     make_hook("layer0", layer_outputs_ref)
                 )
             )
+            # Also hook the attention module inside layer 0
+            if hasattr(base_model.layers[0], "self_attn"):
+                hooks.append(
+                    base_model.layers[0].self_attn.register_forward_hook(
+                        make_hook("layer0_attn", layer_outputs_ref)
+                    )
+                )
+            # And the input layernorm
+            if hasattr(base_model.layers[0], "input_layernorm"):
+                hooks.append(
+                    base_model.layers[0].input_layernorm.register_forward_hook(
+                        make_hook("layer0_ln", layer_outputs_ref)
+                    )
+                )
         print(f"[CP-SANITY][rank={rank}] Registered {len(hooks)} hooks")
 
         ref_output = model(test_input, position_ids = full_pos.clone())
@@ -231,6 +245,20 @@ def _run_cp_sanity_check(model, manager) -> None:
                             make_hook("layer0", layer_outputs_cp)
                         )
                     )
+                    # Also hook the attention module inside layer 0
+                    if hasattr(base_model.layers[0], "self_attn"):
+                        hooks_cp.append(
+                            base_model.layers[0].self_attn.register_forward_hook(
+                                make_hook("layer0_attn", layer_outputs_cp)
+                            )
+                        )
+                    # And the input layernorm
+                    if hasattr(base_model.layers[0], "input_layernorm"):
+                        hooks_cp.append(
+                            base_model.layers[0].input_layernorm.register_forward_hook(
+                                make_hook("layer0_ln", layer_outputs_cp)
+                            )
+                        )
 
                 cp_output = model(input_ids = test_input, position_ids = full_pos)
                 cp_logits = cp_output.logits
