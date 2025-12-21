@@ -129,6 +129,16 @@ def _run_cp_sanity_check(model, manager) -> None:
             # This ensures unsloth uses SDPA (which gets intercepted by ring attention)
             # instead of Flash Attention (which would bypass ring attention).
             with manager.replay_context():
+                # Check if SDPA function is patched
+                import torch.nn.functional as _F
+
+                _sdpa_fn = _F.scaled_dot_product_attention
+                print(
+                    f"[CP-SANITY][rank={rank}] SDPA function: {_sdpa_fn.__name__ if hasattr(_sdpa_fn, '__name__') else type(_sdpa_fn)}"
+                )
+                print(
+                    f"[CP-SANITY][rank={rank}] SDPA function module: {_sdpa_fn.__module__ if hasattr(_sdpa_fn, '__module__') else 'N/A'}"
+                )
                 # After entering context, buffers are sharded in-place
                 print(
                     f"[CP-SANITY][rank={rank}] Inside context_parallel, input now shape={tuple(test_input.shape)}"
