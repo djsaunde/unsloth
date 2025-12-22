@@ -63,431 +63,7 @@ from transformers.modeling_attn_mask_utils import (
 from ..kernels import *
 from ..tokenizer_utils import *
 import os
-from ..context_parallel import (
-    get_active_context_parallel_manager,
-    _cp_debug_enabled,
-    _cp_debug,
-)
-
-
-def _cp_target_layers(_: Optional[object] = None) -> set[int]:
-    # Llama 3.2 1B has 16 decoder layers indexed 0..15; track first and last.
-    return {0, 15}
-
-
-def _cp_log_layernorm(*args, **kwargs) -> None:
-    return
-
-
-def _cp_reconstruct_tensor_for_logging(
-    tensor: torch.Tensor,
-    seq_dim: int,
-) -> Tuple[Optional[torch.Tensor], bool]:
-    manager = get_active_context_parallel_manager()
-    if (
-        manager is None
-        or not manager.enabled
-        or manager.process_group is None
-        or not dist.is_initialized()
-        or tensor.ndim <= seq_dim
-    ):
-        return None, False
-    local = tensor.detach().contiguous()
-    gathered = [torch.empty_like(local) for _ in range(manager.settings.size)]
-    dist.all_gather(gathered, local, group = manager.process_group)
-    if manager.cp_rank_index != 0:
-        return None, True
-    concat = torch.cat([g.cpu() for g in gathered], dim = seq_dim)
-    return concat, True
-
-
-def _cp_log_sequence_tensor(
-    tag: str,
-    tensor: Optional[torch.Tensor],
-    seq_dim: int = 1,
-    focus: bool = False,
-) -> None:
-    if not (_cp_debug_enabled() and torch.is_tensor(tensor)):
-        return
-    mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
-    if mode == "off":
-        return
-    if focus and mode != "focused":
-        return
-    if not focus and mode != "all":
-        return
-    manager = get_active_context_parallel_manager()
-    cp_active = bool(manager and manager.enabled)
-    cp_size = manager.settings.size if manager else 1
-    cp_rank_index = manager.cp_rank_index if manager else 0
-    shape = tuple(tensor.shape)
-    checksum = tensor.detach().float().sum().item()
-    if focus:
-        prefix = f"[CP-DEBUG][focus] {tag}"
-    else:
-        prefix = f"[CP-DEBUG][{tag}]"
-    if tensor.ndim == 0:
-        seq_len = 0
-        seq_dim_resolved = 0
-    else:
-        seq_dim_resolved = seq_dim % tensor.ndim
-        seq_len = tensor.size(seq_dim_resolved)
-    if cp_active:
-        reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
-            tensor,
-            seq_dim_resolved,
-        )
-        if attempted:
-            if reconstructed is None:
-                return
-            shape = tuple(reconstructed.shape)
-            checksum = reconstructed.to(torch.float64).sum().item()
-            seq_len = reconstructed.size(seq_dim_resolved)
-            message = f"{prefix} rank=0/{cp_size} shape={shape} checksum={checksum:.6f}"
-            if seq_len > 0 and seq_len % 2 == 0:
-                half = seq_len // 2
-                first = (
-                    reconstructed.narrow(seq_dim_resolved, 0, half)
-                    .to(torch.float64)
-                    .sum()
-                    .item()
-                )
-                second = (
-                    reconstructed.narrow(seq_dim_resolved, half, half)
-                    .to(torch.float64)
-                    .sum()
-                    .item()
-                )
-                message += f" halves=({first:.6f},{second:.6f})"
-            _cp_debug(message)
-            return
-        if manager and manager.process_group is None:
-            message = f"{prefix} rank={cp_rank_index}/{cp_size} shape={shape} checksum={checksum:.6f}"
-            _cp_debug(message)
-            return
-    rank_label = "0/1" if not cp_active else f"{cp_rank_index}/{cp_size}"
-    message = f"{prefix} rank={rank_label} shape={shape} checksum={checksum:.6f}"
-    if seq_len > 0 and seq_len % 2 == 0:
-        half = seq_len // 2
-        first = tensor.narrow(seq_dim_resolved, 0, half).detach().float().sum().item()
-        second = (
-            tensor.narrow(seq_dim_resolved, half, half).detach().float().sum().item()
-        )
-        message += f" halves=({first:.6f},{second:.6f})"
-    _cp_debug(message)
-
-
-def _cp_log_embed_consistency(
-    model,
-    input_ids: Optional[torch.Tensor],
-    inputs_embeds: Optional[torch.Tensor],
-) -> None:
-    if not _cp_debug_enabled():
-        return
-    if os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() != "focused":
-        return
-    if input_ids is None or inputs_embeds is None:
-        return
-    cp_manager = get_active_context_parallel_manager()
-    if not (cp_manager and cp_manager.enabled):
-        return
-    group = cp_manager.process_group
-    if group is None or cp_manager.settings.size <= 1:
-        return
-    if not dist.is_initialized():
-        return
-    seq_dim = 1
-    if input_ids.ndim <= seq_dim or inputs_embeds.ndim <= seq_dim:
-        return
-    local_seq = input_ids.size(seq_dim)
-    if local_seq == 0:
-        return
-    cp_size = cp_manager.settings.size
-    gather_shape = [
-        torch.empty_like(input_ids, device = input_ids.device) for _ in range(cp_size)
-    ]
-    dist.all_gather(gather_shape, input_ids, group = group)
-    baseline = torch.zeros(
-        cp_size,
-        dtype = torch.float32,
-        device = inputs_embeds.device,
-    )
-    if cp_manager.cp_rank_index == 0:
-        with torch.no_grad():
-            full_ids = torch.cat(gather_shape, dim = seq_dim)
-            full_embeds = model.embed_tokens(full_ids)
-            chunks = torch.chunk(full_embeds, cp_size, dim = seq_dim)
-            if len(chunks) != cp_size:
-                raise RuntimeError(
-                    f"Context parallel chunking failed: expected {cp_size} segments, got {len(chunks)}."
-                )
-            for idx, chunk in enumerate(chunks):
-                baseline[idx] = chunk.detach().float().sum()
-    dist.broadcast(baseline, src = 0, group = group)
-    expected = baseline[cp_manager.cp_rank_index].item()
-    local_sum = inputs_embeds.detach().float().sum().item()
-    diff = local_sum - expected
-    _cp_debug(
-        f"[CP-DEBUG][focus] embed-chunk rank={cp_manager.cp_rank_index}/{cp_size} local={local_sum:.6f} expected={expected:.6f} diff={diff:+.6f}"
-    )
-    if cp_manager.cp_rank_index == 0:
-        chunks = ", ".join(f"{value:.6f}" for value in baseline.tolist())
-        _cp_debug(f"[CP-DEBUG][focus] embed-baseline chunks=[{chunks}]")
-
-
-_CP_BASELINE_INPUTS_CACHE: Optional[torch.Tensor] = None
-
-
-def _cp_baseline_path() -> Optional[str]:
-    return os.environ.get("UNSLOTH_CP_BASELINE_PATH")
-
-
-def _cp_maybe_save_inputs_baseline(tensor: torch.Tensor) -> None:
-    path = _cp_baseline_path()
-    if path is None:
-        return
-    manager = get_active_context_parallel_manager()
-    if manager and manager.enabled:
-        return
-    target_path = (
-        os.path.join(path, "unsloth_cp_inputs_baseline.pt")
-        if os.path.isdir(path)
-        else path
-    )
-    if (
-        os.path.exists(target_path)
-        and os.environ.get("UNSLOTH_CP_OVERWRITE_BASELINE") != "1"
-    ):
-        return
-    data = tensor.detach().cpu()
-    torch.save(
-        {
-            "tensor": data,
-            "shape": tuple(data.shape),
-            "dtype": str(data.dtype),
-        },
-        target_path,
-    )
-    if _cp_debug_enabled():
-        _cp_debug(
-            f"[CP-DEBUG][focus] saved baseline inputs to {target_path} shape={tuple(data.shape)}"
-        )
-
-
-def _cp_load_baseline_inputs(device: torch.device) -> Optional[torch.Tensor]:
-    global _CP_BASELINE_INPUTS_CACHE
-    if _CP_BASELINE_INPUTS_CACHE is not None:
-        return _CP_BASELINE_INPUTS_CACHE.to(device = device)
-    path = _cp_baseline_path()
-    if path is None:
-        return None
-    target_path = (
-        os.path.join(path, "unsloth_cp_inputs_baseline.pt")
-        if os.path.isdir(path)
-        else path
-    )
-    if not os.path.exists(target_path):
-        return None
-    payload = torch.load(target_path, map_location = device)
-    tensor = payload.get("tensor")
-    if not torch.is_tensor(tensor):
-        return None
-    _CP_BASELINE_INPUTS_CACHE = tensor
-    return tensor.to(device = device)
-
-
-def _cp_compare_inputs_with_baseline(tensor: torch.Tensor) -> None:
-    path = _cp_baseline_path()
-    if path is None:
-        return
-    manager = get_active_context_parallel_manager()
-    if not (manager and manager.enabled):
-        return
-    baseline = _cp_load_baseline_inputs(tensor.device)
-    if baseline is None:
-        return
-    seq_dim = 1
-    local_len = tensor.size(seq_dim)
-    total_len = baseline.size(seq_dim)
-    expected_total = local_len * manager.settings.size
-    if expected_total > total_len:
-        if _cp_debug_enabled() and manager.cp_rank_index == 0:
-            _cp_debug(
-                "[CP-DEBUG][focus] baseline length mismatch; skipping comparison."
-            )
-        return
-    start = manager.cp_rank_index * local_len
-    reference = baseline.narrow(seq_dim, start, local_len)
-    diff = tensor.detach() - reference.to(device = tensor.device, dtype = tensor.dtype)
-    max_abs = diff.abs().max().item()
-    local_sum = tensor.detach().float().sum().item()
-    ref_sum = reference.detach().float().sum().item()
-    _cp_debug(
-        f"[CP-DEBUG][focus] inputs-baseline rank={manager.cp_rank_index}/{manager.settings.size} max_abs={max_abs:.6f} local_sum={local_sum:.6f} ref_sum={ref_sum:.6f}"
-    )
-
-
-_CP_BASELINE_IDS_CACHE: Optional[torch.Tensor] = None
-
-
-def _cp_baseline_ids_path() -> Optional[str]:
-    ids_path = os.environ.get("UNSLOTH_CP_BASELINE_IDS_PATH")
-    if ids_path:
-        return ids_path
-    base = _cp_baseline_path()
-    if base is None:
-        return None
-    if os.path.isdir(base):
-        return os.path.join(base, "unsloth_cp_input_ids_baseline.pt")
-    return base + ".ids"
-
-
-def _cp_maybe_save_ids_baseline(tensor: torch.Tensor) -> None:
-    path = _cp_baseline_ids_path()
-    if path is None:
-        return
-    manager = get_active_context_parallel_manager()
-    if manager and manager.enabled:
-        return
-    target_path = path
-    if os.path.isdir(path):
-        target_path = os.path.join(path, "unsloth_cp_input_ids_baseline.pt")
-    if (
-        os.path.exists(target_path)
-        and os.environ.get("UNSLOTH_CP_OVERWRITE_BASELINE") != "1"
-    ):
-        return
-    data = tensor.detach().cpu()
-    torch.save(
-        {"tensor": data, "shape": tuple(data.shape), "dtype": str(data.dtype)},
-        target_path,
-    )
-    if _cp_debug_enabled():
-        _cp_debug(
-            f"[CP-DEBUG][focus] saved baseline input_ids to {target_path} shape={tuple(data.shape)}"
-        )
-
-
-def _cp_load_baseline_ids(device: torch.device) -> Optional[torch.Tensor]:
-    global _CP_BASELINE_IDS_CACHE
-    if _CP_BASELINE_IDS_CACHE is not None:
-        return _CP_BASELINE_IDS_CACHE.to(device = device)
-    path = _cp_baseline_ids_path()
-    if path is None or not os.path.exists(path):
-        return None
-    payload = torch.load(path, map_location = device)
-    tensor = payload.get("tensor")
-    if not torch.is_tensor(tensor):
-        return None
-    _CP_BASELINE_IDS_CACHE = tensor
-    return tensor.to(device = device)
-
-
-def _cp_compare_ids_with_baseline(tensor: torch.Tensor) -> None:
-    path = _cp_baseline_ids_path()
-    if path is None:
-        return
-    manager = get_active_context_parallel_manager()
-    if not (manager and manager.enabled):
-        return
-    baseline = _cp_load_baseline_ids(tensor.device)
-    if baseline is None:
-        return
-    seq_dim = 1
-    local_len = tensor.size(seq_dim)
-    total_len = baseline.size(seq_dim)
-    expected_total = local_len * manager.settings.size
-    if expected_total > total_len:
-        if _cp_debug_enabled() and manager.cp_rank_index == 0:
-            _cp_debug(
-                "[CP-DEBUG][focus] ids baseline shorter than expected; skipping comparison."
-            )
-        return
-    start = manager.cp_rank_index * local_len
-    reference = baseline.narrow(seq_dim, start, local_len)
-    diff_mask = tensor.detach() != reference.to(device = tensor.device)
-    mismatch = diff_mask.any().item()
-    message = f"[CP-DEBUG][focus] ids-baseline rank={manager.cp_rank_index}/{manager.settings.size} match={not mismatch}"
-    if mismatch:
-        idx = diff_mask.flatten().nonzero(as_tuple = False)
-        preview_idx = idx[:5].view(-1).tolist()
-        local_vals = tensor.flatten()[idx[:5]].tolist()
-        ref_vals = reference.flatten()[idx[:5]].tolist()
-        message += f" first_diff_indices={preview_idx} local_vals={local_vals} ref_vals={ref_vals}"
-    _cp_debug(message)
-
-
-def _cp_dump_input_batch(input_ids: Optional[torch.Tensor]) -> None:
-    if os.environ.get("UNSLOTH_CP_DUMP_BATCH") != "1":
-        return
-    if not (_cp_debug_enabled() and isinstance(input_ids, torch.Tensor)):
-        return
-    manager = get_active_context_parallel_manager()
-    seq_dim = 1
-    ids_gpu = input_ids.detach()
-    ids_cpu = ids_gpu.cpu()
-
-    def _emit(label: str, tensor: torch.Tensor) -> None:
-        chunk = 64
-        flat = tensor.flatten().tolist()
-        total = len(flat)
-        checksum = float(tensor.to(torch.float64).sum().item())
-        if total > 512 and os.environ.get("UNSLOTH_CP_DUMP_BATCH_LITERAL") != "1":
-            _cp_debug(
-                f"[CP-DEBUG][focus] input_ids {label} len={total} preview={flat[:chunk]}"
-            )
-            _cp_debug(
-                f"[CP-DEBUG][focus] input_ids {label} checksum={checksum} len={total}"
-            )
-            return
-        for start in range(0, total, chunk):
-            end = min(start + chunk, total)
-            _cp_debug(
-                f"[CP-DEBUG][focus] input_ids {label} idx={start}:{end} tokens={flat[start:end]}"
-            )
-        _cp_debug(
-            f"[CP-DEBUG][focus] input_ids {label} checksum={checksum} len={total}"
-        )
-
-    if manager and manager.enabled and manager.process_group is not None:
-        gathered_gpu = [torch.empty_like(ids_gpu) for _ in range(manager.settings.size)]
-        dist.all_gather(gathered_gpu, ids_gpu, group = manager.process_group)
-        if manager.cp_rank_index != 0:
-            return
-        concat = torch.cat([g.cpu() for g in gathered_gpu], dim = seq_dim)
-        _emit("cp=on", concat)
-        raw = manager.consume_raw_input_ids()
-        if isinstance(raw, torch.Tensor):
-            _emit("cp=reordered", raw)
-    else:
-        _emit("cp=off", ids_cpu)
-
-
-def _reference_rms_norm(layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
-    eps = getattr(layernorm, "variance_epsilon", getattr(layernorm, "eps", 1e-6))
-    variance = hidden_states.to(torch.float32)
-    variance = variance.pow(2).mean(-1, keepdim = True)
-    inv = torch.rsqrt(variance + eps)
-    inv = inv.to(dtype = hidden_states.dtype)
-    normed = hidden_states * inv
-    weight = layernorm.weight
-    if torch.is_tensor(weight) and weight.dtype != hidden_states.dtype:
-        weight = weight.to(hidden_states.dtype)
-    return normed * weight
-
-
-def _cp_should_use_reference_rms(layer) -> bool:
-    if os.environ.get("UNSLOTH_CP_FORCE_FAST_RMS", "0") == "1":
-        return False
-    manager = get_active_context_parallel_manager()
-    if not (manager and manager.enabled):
-        return False
-    mode = os.environ.get("UNSLOTH_CP_REF_RMS_MODE", "all").lower()
-    layer_id = getattr(layer, "layer_idx", None)
-    if mode == "layer0":
-        return layer_id == 0
-    return True
-
+from ..context_parallel import get_active_context_parallel_manager
 
 if HAS_FLASH_ATTENTION:
     from flash_attn import flash_attn_func
@@ -991,66 +567,6 @@ def LlamaAttention_fast_forward(
     cp_active = bool(cp_manager and cp_manager.enabled)
     cp_size = cp_manager.settings.size if cp_manager else 1
     cp_rank_index = cp_manager.cp_rank_index if cp_manager else 0
-    focus_layers = _cp_target_layers()
-
-    def _cp_log_tensor(tag: str, tensor: torch.Tensor, seq_dim: int) -> None:
-        if not _cp_debug_enabled() or not torch.is_tensor(tensor):
-            return
-        mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
-        if mode == "off":
-            return
-        layer_id = getattr(self, "layer_idx", None)
-        if mode == "focused" and layer_id not in focus_layers:
-            return
-        if tensor.ndim == 0:
-            seq_len = 0
-            seq_dim_resolved = 0
-        else:
-            seq_dim_resolved = seq_dim % tensor.ndim
-            seq_len = tensor.size(seq_dim_resolved)
-        log_tensor = tensor
-        rank_label = "0/1"
-        if cp_active:
-            reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
-                tensor,
-                seq_dim_resolved,
-            )
-            if attempted:
-                if reconstructed is None:
-                    return
-                log_tensor = reconstructed
-                rank_label = f"0/{cp_size}"
-            else:
-                rank_label = f"{cp_rank_index}/{cp_size}"
-        checksum = log_tensor.detach().float().sum().item()
-        shape = tuple(log_tensor.shape)
-        prefix = "[CP-DEBUG][attn-in]"
-        if mode == "focused":
-            prefix = "[CP-DEBUG][focus] attn"
-        message = (
-            f"{prefix} rank={rank_label} layer={getattr(self, 'layer_idx', None)} {tag} "
-            f"shape={shape} checksum={checksum:.6f}"
-        )
-        if seq_len > 0 and seq_len % 2 == 0:
-            half = seq_len // 2
-            first = (
-                log_tensor.narrow(seq_dim_resolved, 0, half)
-                .detach()
-                .float()
-                .sum()
-                .item()
-            )
-            second = (
-                log_tensor.narrow(seq_dim_resolved, half, half)
-                .detach()
-                .float()
-                .sum()
-                .item()
-            )
-            message += f" halves=({first:.6f},{second:.6f})"
-        _cp_debug(message)
-
-    _cp_log_tensor("hidden_states", hidden_states, 1)
     Q, K, V = self.apply_qkv(self, hidden_states)
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
@@ -1059,19 +575,6 @@ def LlamaAttention_fast_forward(
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
-
-    if (
-        cp_active
-        and os.environ.get("UNSLOTH_CP_BREAKPOINT")
-        and torch.distributed.is_initialized()
-    ):
-        try:
-            target_rank = int(os.environ["UNSLOTH_CP_BREAKPOINT"])
-        except ValueError:
-            target_rank = 0
-        if torch.distributed.get_rank() == target_rank:
-            torch.distributed.breakpoint()
-        os.environ.pop("UNSLOTH_CP_BREAKPOINT", None)
 
     required_seq_len = kv_seq_len
     if isinstance(position_ids, torch.Tensor) and position_ids.numel() > 0:
@@ -1126,9 +629,6 @@ def LlamaAttention_fast_forward(
 
     cos, sin = _slice_rope_frequencies(cos, sin)
     Q, K = fast_rope_embedding(Q, K, cos, sin)
-    _cp_log_tensor("Q", Q, -2)
-    _cp_log_tensor("K", K, -2)
-    _cp_log_tensor("V", V, -2)
 
     if past_key_value is not None:
         K = torch.cat([past_key_value[0], K], dim = 2)
@@ -1144,36 +644,6 @@ def LlamaAttention_fast_forward(
         and attention_mask is None
     )
     use_flash = (not cp_active) and HAS_FLASH_ATTENTION and attention_mask is None
-
-    # Debug: verify cp_active is True during attention forward
-    if (
-        os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1"
-        and getattr(self, "layer_idx", 0) == 0
-    ):
-        import torch.distributed as _dist
-
-        _rank = _dist.get_rank() if _dist.is_initialized() else 0
-        print(
-            f"[CP-ATTN-DEBUG][rank={_rank}] layer_idx=0 cp_active={cp_active} "
-            f"use_flash={use_flash} use_xformers={use_xformers} Q.shape={tuple(Q.shape)}"
-        )
-
-    if cp_active and (use_xformers or use_flash) and _cp_debug_enabled():
-        _cp_debug(
-            "[CP-DEBUG][attn] Context parallel requested but non-SDPA path selected; forcing SDPA."
-        )
-
-    # Debug: trace attention path
-    if (
-        os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1"
-        and getattr(self, "layer_idx", 0) == 0
-    ):
-        import torch.distributed as _dist
-
-        _rank = _dist.get_rank() if _dist.is_initialized() else 0
-        print(
-            f"[CP-ATTN-PATH][rank={_rank}] cp_active={cp_active} use_xformers={use_xformers} use_flash={use_flash} SDPA_HAS_GQA={SDPA_HAS_GQA}"
-        )
 
     if use_xformers:
         # Xformers memory efficient attention
@@ -1213,54 +683,6 @@ def LlamaAttention_fast_forward(
         if SDPA_HAS_GQA:
             # Needs (batch_size, n_heads, seq_len, head_dim)
             # is_casual and attention_mask must not be both set!
-            # CP Debug: Check if ring attention should be active
-            _layer_idx = getattr(self, "layer_idx", 0)
-            _sanity_check_layer0 = (
-                cp_active
-                and os.environ.get("UNSLOTH_CP_SANITY_CHECK") == "1"
-                and _layer_idx == 0
-            )
-            _sdpa_debug = os.environ.get("UNSLOTH_CP_DEBUG_SDPA") == "1"
-            if _sdpa_debug or _sanity_check_layer0:
-                import torch.distributed as _dist
-
-                _rank = _dist.get_rank() if _dist.is_initialized() else 0
-                print(
-                    f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] SDPA call: Q={tuple(Q.shape)} K={tuple(K.shape)} V={tuple(V.shape)} is_causal={is_causal} cp_active={cp_active}"
-                )
-                # Check if TorchFunctionMode or TorchDispatchMode is active (ring attention uses these)
-                try:
-                    from torch.overrides import _get_current_function_mode_stack
-
-                    func_stack = _get_current_function_mode_stack()
-                    print(
-                        f"[CP-SDPA-DEBUG][rank={_rank}] TorchFunctionMode stack: {[type(m).__name__ for m in func_stack]}"
-                    )
-                except Exception as e:
-                    print(f"[CP-SDPA-DEBUG][rank={_rank}] TorchFunctionMode error: {e}")
-                try:
-                    from torch.utils._python_dispatch import (
-                        _get_current_dispatch_mode_stack,
-                    )
-
-                    dispatch_stack = _get_current_dispatch_mode_stack()
-                    print(
-                        f"[CP-SDPA-DEBUG][rank={_rank}] TorchDispatchMode stack: {[type(m).__name__ for m in dispatch_stack]}"
-                    )
-                except Exception as e:
-                    print(f"[CP-SDPA-DEBUG][rank={_rank}] TorchDispatchMode error: {e}")
-                # Check if Q, K, V are DTensors (required for ring attention)
-                try:
-                    from torch.distributed.tensor import DTensor
-
-                    _q_is_dtensor = isinstance(Q, DTensor)
-                    _k_is_dtensor = isinstance(K, DTensor)
-                    _v_is_dtensor = isinstance(V, DTensor)
-                    print(
-                        f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] Q is DTensor: {_q_is_dtensor}, K is DTensor: {_k_is_dtensor}, V is DTensor: {_v_is_dtensor}"
-                    )
-                except Exception as e:
-                    print(f"[CP-SDPA-DEBUG][rank={_rank}] DTensor check error: {e}")
             # IMPORTANT: When context parallelism is active, we must use
             # torch.nn.functional.scaled_dot_product_attention directly (not through F)
             # because context_parallel monkey-patches the function on the module,
@@ -1270,45 +692,6 @@ def LlamaAttention_fast_forward(
                 if cp_active
                 else F.scaled_dot_product_attention
             )
-            if _sdpa_debug or _sanity_check_layer0:
-                print(
-                    f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] Calling SDPA fn: {_sdpa_fn.__name__} from {_sdpa_fn.__module__}"
-                )
-            # Debug: check if SDPA is patched for context parallel
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1" and _layer_idx == 0:
-                is_patched = hasattr(_sdpa_fn, "__wrapped__") or "wrapper" in str(
-                    type(_sdpa_fn)
-                )
-                print(
-                    f"[CP-SDPA-DEBUG][rank={_rank}] SDPA function: {_sdpa_fn} is_patched={is_patched} id={id(_sdpa_fn)}"
-                )
-                if hasattr(_sdpa_fn, "__closure__") and _sdpa_fn.__closure__:
-                    print(
-                        f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] SDPA fn has closure with {len(_sdpa_fn.__closure__)} cells"
-                    )
-            # Debug: Check SDPA backend being used (ring attention only works with flash/efficient)
-            if os.environ.get("UNSLOTH_CP_DEBUG_BACKEND") == "1" and _layer_idx == 0:
-                try:
-                    ctx = torch.backends.cuda.sdp_kernel(
-                        enable_flash = True, enable_math = True, enable_mem_efficient = True
-                    )
-                    with ctx:
-                        # Check which backend would be used
-                        from torch.nn.attention import SDPBackend, sdpa_kernel
-
-                        # This will show what backend is available
-                        print(f"[CP-BACKEND][rank={_rank}] Checking SDPA backends...")
-                        print(
-                            f"[CP-BACKEND][rank={_rank}] Flash available: {torch.backends.cuda.flash_sdp_enabled()}"
-                        )
-                        print(
-                            f"[CP-BACKEND][rank={_rank}] Mem efficient available: {torch.backends.cuda.mem_efficient_sdp_enabled()}"
-                        )
-                        print(
-                            f"[CP-BACKEND][rank={_rank}] Math available: {torch.backends.cuda.math_sdp_enabled()}"
-                        )
-                except Exception as e:
-                    print(f"[CP-BACKEND][rank={_rank}] Backend check error: {e}")
             A = _sdpa_fn(
                 Q,
                 K,
@@ -1317,10 +700,6 @@ def LlamaAttention_fast_forward(
                 is_causal = is_causal,
                 enable_gqa = n_groups != 1,
             )
-            if _sdpa_debug or _sanity_check_layer0:
-                print(
-                    f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] SDPA output: A={tuple(A.shape)}"
-                )
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2)  # .contiguous()
         else:
@@ -1349,64 +728,6 @@ def LlamaAttention_fast_forward(
             # Go back to (batch_size, seq_len, n_heads, head_dim)
             A = A.transpose(1, 2).contiguous()
         pass
-    if _cp_debug_enabled():
-        layer_id = getattr(self, "layer_idx", None)
-        mode = os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower()
-        if mode == "off":
-            pass
-        elif mode == "focused" and layer_id not in focus_layers:
-            pass
-        else:
-            prefix = "[CP-DEBUG][attn-out]"
-            if mode == "focused":
-                prefix = "[CP-DEBUG][focus] attn"
-            if torch.is_tensor(A):
-                if A.ndim == 0:
-                    seq_dim_resolved = 0
-                else:
-                    seq_dim_resolved = 1 % A.ndim
-                log_tensor = A
-                rank_label = "0/1"
-                should_log = True
-                if cp_active:
-                    reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
-                        A,
-                        seq_dim_resolved,
-                    )
-                    if attempted:
-                        if reconstructed is None:
-                            should_log = False
-                        else:
-                            log_tensor = reconstructed
-                            rank_label = f"0/{cp_size}"
-                    else:
-                        rank_label = f"{cp_rank_index}/{cp_size}"
-                if should_log:
-                    seq_len = (
-                        log_tensor.size(seq_dim_resolved)
-                        if log_tensor.ndim > seq_dim_resolved
-                        else 0
-                    )
-                    checksum = log_tensor.detach().float().sum().item()
-                    message = f"{prefix} rank={rank_label} layer={layer_id} checksum={checksum:.6f}"
-                    if seq_len > 0 and seq_len % 2 == 0:
-                        half = seq_len // 2
-                        first = (
-                            log_tensor.narrow(seq_dim_resolved, 0, half)
-                            .detach()
-                            .float()
-                            .sum()
-                            .item()
-                        )
-                        second = (
-                            log_tensor.narrow(seq_dim_resolved, half, half)
-                            .detach()
-                            .float()
-                            .sum()
-                            .item()
-                        )
-                        message += f" halves=({first:.6f},{second:.6f})"
-                    _cp_debug(message)
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
     attn_output = self.apply_o(self, attn_output)
     attn_weights = None
@@ -1441,87 +762,11 @@ def LlamaDecoderLayer_fast_forward(
             (see `past_key_values`).
         past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
     """
-
-    focus_layers = _cp_target_layers()
-
-    def _cp_log_rms_inputs(stage: str, tensor: torch.Tensor, norm_module) -> None:
-        layer_id = getattr(self, "layer_idx", None)
-        if layer_id not in focus_layers:
-            return
-        _cp_log_sequence_tensor(
-            f"rms.{stage}.input.layer={layer_id}",
-            tensor,
-            1,
-            focus = True,
-        )
-        weight = getattr(norm_module, "weight", None)
-        if torch.is_tensor(weight):
-            _cp_log_sequence_tensor(
-                f"rms.{stage}.weight.layer={layer_id}",
-                weight,
-                0,
-                focus = True,
-            )
-
-    def _cp_log_rms_output(stage: str, tensor: torch.Tensor) -> None:
-        layer_id = getattr(self, "layer_idx", None)
-        if layer_id not in focus_layers:
-            return
-        _cp_log_sequence_tensor(
-            f"rms.{stage}.output.layer={layer_id}",
-            tensor,
-            1,
-            focus = True,
-        )
-
-    def _cp_log_residual(tag: str, tensor: torch.Tensor) -> None:
-        layer_id = getattr(self, "layer_idx", None)
-        if layer_id not in focus_layers:
-            return
-        _cp_log_sequence_tensor(
-            f"residual.{tag}.layer={layer_id}",
-            tensor,
-            1,
-            focus = True,
-        )
-
-    use_reference_rms = _cp_should_use_reference_rms(self)
-    focus_logging = (
-        _cp_debug_enabled()
-        and os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() == "focused"
-    )
-    layer_id = getattr(self, "layer_idx", None)
-    if (
-        use_reference_rms
-        and focus_logging
-        and layer_id in focus_layers
-        and not getattr(self, "_cp_reference_rms_logged", False)
-    ):
-        setattr(self, "_cp_reference_rms_logged", True)
-        cp_manager = get_active_context_parallel_manager()
-        rank = cp_manager.cp_rank_index if (cp_manager and cp_manager.enabled) else 0
-        size = cp_manager.settings.size if (cp_manager and cp_manager.enabled) else 1
-        _cp_debug(
-            f"[CP-DEBUG][focus] layer=0 using reference RMSNorm fallback rank={rank}/{size}"
-        )
-
-    def _apply_rms(norm_module, tensor: torch.Tensor, inference: bool, stage: str):
-        if use_reference_rms:
-            out = _reference_rms_norm(norm_module, tensor)
-        elif inference:
-            out = fast_rms_layernorm_inference(norm_module, tensor)
-        else:
-            out = fast_rms_layernorm(norm_module, tensor)
-        _cp_log_rms_output(stage, out)
-        return out
-
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
-        _cp_log_residual("pre_attn_input", residual)
-        _cp_log_layernorm("input.pre", hidden_states)
-        _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
-        hidden_states = _apply_rms(self.input_layernorm, hidden_states, True, "input")
-        _cp_log_layernorm("input.post", hidden_states)
+        hidden_states = fast_rms_layernorm_inference(
+            self.input_layernorm, hidden_states
+        )
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
             causal_mask = causal_mask,
@@ -1533,32 +778,19 @@ def LlamaDecoderLayer_fast_forward(
             padding_mask = padding_mask,
             position_embeddings = position_embeddings,
         )
-        _cp_log_residual("attn_out", hidden_states)
         hidden_states += residual
-        _cp_log_residual("post_attn_add", hidden_states)
 
         # Fully Connected
         residual = hidden_states
-        _cp_log_residual("pre_mlp_input", residual)
-        _cp_log_layernorm("post.pre", hidden_states)
-        _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
-        hidden_states = _apply_rms(
+        hidden_states = fast_rms_layernorm_inference(
             self.post_attention_layernorm,
             hidden_states,
-            True,
-            "post",
         )
-        _cp_log_layernorm("post.post", hidden_states)
         hidden_states = fast_swiglu_inference(self.mlp, hidden_states)
         hidden_states += residual
-        _cp_log_residual("post_mlp_add", hidden_states)
     else:
         residual = hidden_states
-        _cp_log_residual("pre_attn_input", residual)
-        _cp_log_layernorm("input.pre", hidden_states)
-        _cp_log_rms_inputs("input", hidden_states, self.input_layernorm)
-        hidden_states = _apply_rms(self.input_layernorm, hidden_states, False, "input")
-        _cp_log_layernorm("input.post", hidden_states)
+        hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
             causal_mask = causal_mask,
@@ -1570,25 +802,16 @@ def LlamaDecoderLayer_fast_forward(
             padding_mask = padding_mask,
             position_embeddings = position_embeddings,
         )
-        _cp_log_residual("attn_out", hidden_states)
         hidden_states = residual + hidden_states
-        _cp_log_residual("post_attn_add", hidden_states)
 
         # Fully Connected
         residual = hidden_states
-        _cp_log_residual("pre_mlp_input", residual)
-        _cp_log_layernorm("post.pre", hidden_states)
-        _cp_log_rms_inputs("post", hidden_states, self.post_attention_layernorm)
-        hidden_states = _apply_rms(
+        hidden_states = fast_rms_layernorm(
             self.post_attention_layernorm,
             hidden_states,
-            False,
-            "post",
         )
-        _cp_log_layernorm("post.post", hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        _cp_log_residual("post_mlp_add", hidden_states)
 
     outputs = (hidden_states,)
     if output_attentions:
@@ -1698,62 +921,10 @@ def LlamaModel_fast_forward(
             position_ids = position_ids.repeat((batch_size, 1))
         # Note: position_ids are already correctly sharded by context_parallel
         # (including with load balancing). No adjustment needed here.
-        if _cp_debug_enabled():
-            preview = position_ids[0][: min(16, position_ids.shape[-1])].tolist()
-            _cp_debug(
-                f"[CP-DEBUG][model] rank={cp_rank_index if cp_manager else 0} local position_ids preview={preview} max={int(position_ids.max().item())}"
-            )
 
     # Embed positions
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
-    _cp_log_sequence_tensor("embed", inputs_embeds, 1)
-    _cp_log_embed_consistency(self, input_ids, inputs_embeds)
-    if (
-        _cp_debug_enabled()
-        and os.environ.get("UNSLOTH_CP_DEBUG_MODE", "off").lower() == "focused"
-    ):
-        manager = get_active_context_parallel_manager()
-        # Optional: override inputs with baseline for reproducibility
-        enforced = False
-        if os.environ.get("UNSLOTH_CP_ENFORCE_BASELINE", "0") == "1":
-            if manager and manager.enabled:
-                baseline_ids = None
-                baseline_embeds = _cp_load_baseline_inputs(inputs_embeds.device)
-                if isinstance(input_ids, torch.Tensor):
-                    baseline_ids = _cp_load_baseline_ids(input_ids.device)
-                if baseline_ids is not None and isinstance(input_ids, torch.Tensor):
-                    seq_dim = 1
-                    local_len = input_ids.size(seq_dim)
-                    start = manager.cp_rank_index * local_len
-                    input_ids = baseline_ids.narrow(seq_dim, start, local_len).to(
-                        device = input_ids.device
-                    )
-                    enforced = True
-                if baseline_embeds is not None:
-                    seq_dim = 1
-                    local_len = inputs_embeds.size(seq_dim)
-                    start = manager.cp_rank_index * local_len
-                    inputs_embeds = baseline_embeds.narrow(
-                        seq_dim, start, local_len
-                    ).to(device = inputs_embeds.device, dtype = inputs_embeds.dtype)
-                    enforced = True
-                if enforced:
-                    _cp_debug(
-                        f"[CP-DEBUG][focus] enforced baseline rank={manager.cp_rank_index}/{manager.settings.size}"
-                    )
-        # After potential enforcement, log/save baselines
-        manager = get_active_context_parallel_manager()
-        if manager and manager.enabled:
-            _cp_compare_inputs_with_baseline(inputs_embeds)
-            if input_ids is not None:
-                _cp_compare_ids_with_baseline(input_ids)
-                _cp_dump_input_batch(input_ids)
-        else:
-            _cp_maybe_save_inputs_baseline(inputs_embeds)
-            if input_ids is not None:
-                _cp_maybe_save_ids_baseline(input_ids)
-                _cp_dump_input_batch(input_ids)
 
     inputs_embeds = inputs_embeds.to(_get_dtype(dtype_from_config(self.config)))
 
@@ -2305,15 +1476,6 @@ def CausalLM_fast_forward(fast_forward_inference):
                 # Use unsloth_fused_ce_loss which actually calculates the best chunk size to reduce VRAM usage
                 RETURN_LOGITS = False
 
-            # Debug: trace code path
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                import torch.distributed as _dist_path
-
-                _rank_path = _dist_path.get_rank() if _dist_path.is_initialized() else 0
-                print(
-                    f"[CP-LB-DEBUG][PATH][rank={_rank_path}] RETURN_LOGITS={RETURN_LOGITS} labels_is_tensor={torch.is_tensor(labels)} has_pre_shift_labels={has_pre_shift_labels} bsz={bsz} q_len={q_len}"
-                )
-
             if not RETURN_LOGITS and labels is not None:
                 n_items = kwargs.get("num_items_in_batch", None)
                 if n_items is None:
@@ -2321,32 +1483,6 @@ def CausalLM_fast_forward(fast_forward_inference):
 
                 if self.config.model_type == "falcon_h1":
                     hidden_states = hidden_states * self.config.lm_head_multiplier
-                if _cp_debug_enabled() and torch.is_tensor(hidden_states):
-                    manager = get_active_context_parallel_manager()
-                    seq_dim = 1 if hidden_states.ndim > 1 else 0
-                    log_tensor = hidden_states
-                    rank_label = "0/1"
-                    if manager and manager.enabled:
-                        reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
-                            hidden_states,
-                            seq_dim,
-                        )
-                        if attempted:
-                            log_tensor = reconstructed
-                            rank_label = (
-                                f"0/{manager.settings.size}"
-                                if reconstructed is not None
-                                else None
-                            )
-                        else:
-                            rank_label = (
-                                f"{manager.cp_rank_index}/{manager.settings.size}"
-                            )
-                    if log_tensor is not None:
-                        checksum = log_tensor.detach().float().sum().item()
-                        _cp_debug(
-                            f"[CP-DEBUG][logits-hidden] rank={rank_label} shape={tuple(log_tensor.shape)} checksum={checksum:.6f}"
-                        )
 
                 ### DISABLED since T4 breaks
                 # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages` may help.
@@ -2360,19 +1496,6 @@ def CausalLM_fast_forward(fast_forward_inference):
                 effective_labels = (
                     _get_shift_labels() if has_pre_shift_labels else labels
                 )
-                # Load balancing debug: log effective_labels before fused loss
-                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                    import torch.distributed as _dist_lb2
-
-                    _rank_lb2 = (
-                        _dist_lb2.get_rank() if _dist_lb2.is_initialized() else 0
-                    )
-                    if torch.is_tensor(effective_labels):
-                        eff_flat = effective_labels.flatten().tolist()
-                        valid_count = (effective_labels != -100).sum().item()
-                        print(
-                            f"[CP-LB-DEBUG][FUSED-LOSS][rank={_rank_lb2}] effective_labels[:15]={eff_flat[:15]} valid={valid_count} shift_labels={not has_pre_shift_labels}"
-                        )
                 loss = unsloth_fused_ce_loss(
                     trainer = None,
                     hidden_states = hidden_states,
@@ -2387,22 +1510,6 @@ def CausalLM_fast_forward(fast_forward_inference):
                     logit_softcapping = logit_softcapping,
                     shift_labels = not has_pre_shift_labels,
                 )
-                # Load balancing debug: log loss after fused computation
-                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1" and torch.is_tensor(
-                    loss
-                ):
-                    import torch.distributed as _dist_lb3
-
-                    _rank_lb3 = (
-                        _dist_lb3.get_rank() if _dist_lb3.is_initialized() else 0
-                    )
-                    print(
-                        f"[CP-LB-DEBUG][FUSED-LOSS][rank={_rank_lb3}] loss={loss.detach().float().item():.6f}"
-                    )
-                if _cp_debug_enabled() and torch.is_tensor(loss):
-                    _cp_debug(
-                        f"[CP-DEBUG][loss] value={loss.detach().float().item():.6f}"
-                    )
                 if not return_dict:
                     output = (logits,) + outputs[1:]
                     return (loss,) + output if loss is not None else output
@@ -2419,29 +1526,6 @@ def CausalLM_fast_forward(fast_forward_inference):
             logits = self.lm_head(hidden_states.to(dtype))
 
         logits = logits.to(_get_dtype(dtype_from_config(self.config)))
-        if _cp_debug_enabled() and torch.is_tensor(logits):
-            manager = get_active_context_parallel_manager()
-            seq_dim = 1 if logits.ndim > 1 else 0
-            log_tensor = logits
-            rank_label = "0/1"
-            if manager and manager.enabled:
-                reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
-                    logits,
-                    seq_dim,
-                )
-                if attempted:
-                    if reconstructed is None:
-                        log_tensor = None
-                    else:
-                        log_tensor = reconstructed
-                        rank_label = f"0/{manager.settings.size}"
-                else:
-                    rank_label = f"{manager.cp_rank_index}/{manager.settings.size}"
-            if log_tensor is not None:
-                checksum = log_tensor.detach().float().sum().item()
-                _cp_debug(
-                    f"[CP-DEBUG][logits] rank={rank_label} shape={tuple(log_tensor.shape)} checksum={checksum:.6f}"
-                )
         loss = None
         logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
         logit_scaling = getattr(self.config, "logit_scale", 0)
@@ -2460,82 +1544,6 @@ def CausalLM_fast_forward(fast_forward_inference):
             n_items = kwargs.get("num_items_in_batch", None)
             if n_items is None:
                 n_items = kwargs.get("n_items", None)
-            if _cp_debug_enabled() and torch.is_tensor(shift_logits):
-                manager = get_active_context_parallel_manager()
-                seq_dim = 1 if shift_logits.ndim > 1 else 0
-                log_tensor = shift_logits
-                rank_label = "0/1"
-                if manager and manager.enabled:
-                    reconstructed, attempted = _cp_reconstruct_tensor_for_logging(
-                        shift_logits,
-                        seq_dim,
-                    )
-                    if attempted:
-                        if reconstructed is not None:
-                            log_tensor = reconstructed
-                            rank_label = f"0/{manager.settings.size}"
-                        else:
-                            log_tensor = None
-                    else:
-                        rank_label = f"{manager.cp_rank_index}/{manager.settings.size}"
-                if log_tensor is not None:
-                    checksum = log_tensor.detach().float().sum().item()
-                    _cp_debug(
-                        f"[CP-DEBUG][loss-input logits] rank={rank_label} checksum={checksum:.6f}"
-                    )
-            if _cp_debug_enabled() and torch.is_tensor(loss_shift_labels):
-                valid = loss_shift_labels.ne(-100)
-                label_sum = (
-                    loss_shift_labels.masked_select(valid).sum().item()
-                    if valid.any()
-                    else 0.0
-                )
-                _cp_debug(
-                    f"[CP-DEBUG][loss-input labels] valid_tokens={valid.sum().item()} checksum={label_sum:.6f}"
-                )
-            # Load balancing debug: sample predictions vs targets and per-position losses
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1" and torch.is_tensor(
-                shift_logits
-            ):
-                import torch.distributed as _dist_lb
-
-                _rank_lb = _dist_lb.get_rank() if _dist_lb.is_initialized() else 0
-                # Sample a few positions
-                positions_to_check = [0, 5, 10, 15, 20, 25]
-                for pos in positions_to_check:
-                    if pos < shift_logits.size(1):
-                        pred = shift_logits[0, pos].argmax().item()
-                        target = loss_shift_labels[0, pos].item()
-                        # Compute per-position loss
-                        if target != -100:
-                            pos_loss = F.cross_entropy(
-                                shift_logits[0, pos : pos + 1],
-                                loss_shift_labels[0, pos : pos + 1],
-                                reduction = "mean",
-                            ).item()
-                        else:
-                            pos_loss = -1  # ignored
-                        print(
-                            f"[CP-LB-DEBUG][LOSS][rank={_rank_lb}] pos={pos} pred={pred} target={target} loss={pos_loss:.4f}"
-                        )
-                # Also show top-5 highest loss positions
-                if loss_shift_labels.size(1) > 0:
-                    with torch.no_grad():
-                        per_pos_loss = F.cross_entropy(
-                            shift_logits[0].float(),
-                            loss_shift_labels[0],
-                            reduction = "none",
-                        )
-                        # Find top losses (excluding ignored positions)
-                        valid_mask = loss_shift_labels[0].ne(-100)
-                        per_pos_loss_masked = per_pos_loss.clone()
-                        per_pos_loss_masked[~valid_mask] = -1
-                        top_losses, top_indices = per_pos_loss_masked.topk(
-                            min(5, valid_mask.sum().item())
-                        )
-                        print(
-                            f"[CP-LB-DEBUG][LOSS][rank={_rank_lb}] TOP-5 losses: {[(idx.item(), loss.item()) for idx, loss in zip(top_indices, top_losses)]}"
-                        )
             loss = fast_cross_entropy_loss(
                 logits = shift_logits,
                 labels = loss_shift_labels,
@@ -2543,8 +1551,6 @@ def CausalLM_fast_forward(fast_forward_inference):
                 logit_scaling = logit_scaling,
                 n_items = n_items,
             )
-            if _cp_debug_enabled() and torch.is_tensor(loss):
-                _cp_debug(f"[CP-DEBUG][loss] value={loss.detach().float().item():.6f}")
         else:
             if logit_scaling != 0:
                 if logits.requires_grad:

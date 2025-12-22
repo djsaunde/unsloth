@@ -26,11 +26,6 @@ try:
         env_lb = os.environ.get("UNSLOTH_CP_LB")
         if env_lb is not None:
             _cp_options.enable_load_balance = env_lb not in ("0", "false", "False")
-        # Debug: print actual LB setting
-        if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-            print(
-                f"[CP-LB-DEBUG][INIT] UNSLOTH_CP_LB={env_lb} enable_load_balance={_cp_options.enable_load_balance}"
-            )
     except Exception:
         pass
 
@@ -490,30 +485,14 @@ def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
         List of hook handles that can be used to remove the hooks later
     """
     handles = []
-    debug = os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1"
-
-    _hook_call_count = [0]  # Use list to allow mutation in closure
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
         # Remove attention_mask and set is_causal=True
         # This ensures ring attention uses causal masking correctly
-        had_mask = (
-            "attention_mask" in module_kwargs
-            and module_kwargs["attention_mask"] is not None
-        )
         if "attention_mask" in module_kwargs:
             module_kwargs["attention_mask"] = None
         if "is_causal" in module_kwargs or hasattr(_module, "is_causal"):
             module_kwargs["is_causal"] = True
-
-        # Debug: log first few hook calls
-        if debug and _hook_call_count[0] < 3:
-            _hook_call_count[0] += 1
-            rank = int(os.environ.get("RANK", "0"))
-            print(
-                f"[CP-HOOK-DEBUG][rank={rank}] Hook called! had_mask={had_mask} kwargs_keys={list(module_kwargs.keys())}"
-            )
-
         return module_args, module_kwargs
 
     # Find all self_attn modules - they may be nested in PEFT wrappers
@@ -565,7 +544,6 @@ class ContextParallelManager:
         self._report_loss: Optional[torch.Tensor] = None
         self._report_tokens: Optional[torch.Tensor] = None
         self._last_global_seq_len: Optional[int] = None
-        self._debug_raw_input_ids: Optional[torch.Tensor] = None
         self._attention_hook_handles: list = []
         self._verify_environment()
         if self.enabled:
@@ -666,16 +644,8 @@ class ContextParallelManager:
 
             self._sdpa_patch_active = True
 
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                print(
-                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Entered SDPA patch for training step"
-                )
-
-        except Exception as e:
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                print(
-                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Failed to enter SDPA patch: {e}"
-                )
+        except Exception:
+            pass
 
     def exit_sdpa_patch(self) -> None:
         """Exit SDPA patching that was entered with enter_sdpa_patch().
@@ -696,10 +666,6 @@ class ContextParallelManager:
             # This ensures backward pass (with gradient checkpointing) sees sharded buffers
             pending = getattr(self, "_pending_buffer_restores", [])
             if pending:
-                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                    print(
-                        f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Restoring {len(pending)} deferred buffers"
-                    )
                 for buffer, original in pending:
                     buffer.resize_(original.shape)
                     buffer.copy_(original)
@@ -718,16 +684,8 @@ class ContextParallelManager:
 
             self._sdpa_patch_active = False
 
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                print(
-                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Exited SDPA patch for training step"
-                )
-
-        except Exception as e:
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                print(
-                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Failed to exit SDPA patch: {e}"
-                )
+        except Exception:
+            pass
 
     def _verify_environment(self) -> None:
         if not self.enabled:
@@ -867,11 +825,6 @@ class ContextParallelManager:
         positions = base.view(view_shape).expand_as(input_ids)
         positions = positions.to(dtype = torch.long)
         inputs["position_ids"] = positions
-        if _cp_debug_enabled():
-            preview = positions.flatten().tolist()[: min(16, positions.numel())]
-            _cp_debug(
-                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] synthesized position_ids preview={preview}"
-            )
 
     def _ensure_shift_labels(self, inputs: dict[str, torch.Tensor]) -> None:
         """
@@ -902,26 +855,12 @@ class ContextParallelManager:
         padded = F.pad(labels, (0, 1), value = ignore_index)
         shift_labels = padded[:, 1:].contiguous()
         inputs["shift_labels"] = shift_labels
-        if _cp_debug_enabled():
-            preview = shift_labels.flatten().tolist()[: min(16, shift_labels.numel())]
-            _cp_debug(
-                f"[CP-DEBUG][cp-rank={self._cp_rank_index}] synthesized shift_labels preview={preview}"
-            )
         # Load balancing debug: log shift_labels BEFORE reordering
-        if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-            sl_flat = shift_labels.flatten().tolist()
-            lbl_flat = labels.flatten().tolist()
-            print(
-                f"[CP-LB-DEBUG][BEFORE-REORDER] labels[:20]={lbl_flat[:20]} "
-                f"shift_labels[:20]={sl_flat[:20]} seq_len={labels.size(1)}"
-            )
 
     def _debug_validate_buffers(
         self,
         buffers: list[torch.Tensor],
     ) -> None:
-        if not _cp_debug_enabled():
-            return
         if not buffers or self._cp_group is None:
             return
         summaries: list[tuple] = []
@@ -943,9 +882,6 @@ class ContextParallelManager:
                 raise RuntimeError(
                     f"Context parallel buffers differ across ranks before sharding (rank {idx} mismatch)."
                 )
-        _cp_debug(
-            f"[CP-DEBUG][cp-rank={self._cp_rank_index}] pre-shard buffers match across {self.settings.size} ranks."
-        )
 
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
@@ -965,18 +901,6 @@ class ContextParallelManager:
                 yield
                 return
             # Debug: verify load balance setting at runtime
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                try:
-                    from torch.distributed.tensor.experimental._attention import (
-                        _cp_options,
-                    )
-
-                    print(
-                        f"[CP-LB-DEBUG][RUNTIME][rank={self._cp_rank_index}] enable_load_balance={_cp_options.enable_load_balance}"
-                    )
-                except Exception:
-                    pass
-
             # If SDPA is already patched (via enter_sdpa_patch), do buffer sharding only
             # to avoid context_parallel's __exit__ from unpatching SDPA before backward
             sdpa_already_patched = getattr(self, "_sdpa_patch_active", False)
@@ -999,27 +923,6 @@ class ContextParallelManager:
                         buffer.copy_(chunk)
 
                     # Load balancing debug: log values AFTER sharding
-                    if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                        _rank = self._cp_rank_index
-                        sl = inputs.get("shift_labels")
-                        iids = inputs.get("input_ids")
-                        pids = inputs.get("position_ids")
-                        if sl is not None:
-                            sl_flat = sl.flatten().tolist()
-                            print(
-                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] shift_labels[:15]={sl_flat[:15]} shape={tuple(sl.shape)}"
-                            )
-                        if iids is not None:
-                            iids_flat = iids.flatten().tolist()
-                            print(
-                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] input_ids[:15]={iids_flat[:15]} shape={tuple(iids.shape)}"
-                            )
-                        if pids is not None:
-                            pids_flat = pids.flatten().tolist()
-                            print(
-                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] position_ids[:15]={pids_flat[:15]} shape={tuple(pids.shape)}"
-                            )
-
                     yield
 
                     # Defer buffer restoration to exit_sdpa_patch()
@@ -1028,11 +931,6 @@ class ContextParallelManager:
                     for buffer, orig in zip(buffers, original_buffers):
                         if orig is not None:
                             self._pending_buffer_restores.append((buffer, orig))
-
-                    if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                        print(
-                            f"[CP-LB-DEBUG][rank={self._cp_rank_index}] Deferred {len([o for o in original_buffers if o is not None])} buffer restorations"
-                        )
 
                 except ImportError:
                     # Fallback to context_parallel if imports fail
@@ -1052,41 +950,10 @@ class ContextParallelManager:
                     no_restore_buffers = no_restore,
                 ):
                     # Load balancing debug: log values AFTER sharding
-                    if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                        _rank = self._cp_rank_index
-                        sl = inputs.get("shift_labels")
-                        iids = inputs.get("input_ids")
-                        pids = inputs.get("position_ids")
-                        if sl is not None:
-                            sl_flat = sl.flatten().tolist()
-                            print(
-                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] shift_labels[:15]={sl_flat[:15]} shape={tuple(sl.shape)}"
-                            )
-                        if iids is not None:
-                            iids_flat = iids.flatten().tolist()
-                            print(
-                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] input_ids[:15]={iids_flat[:15]} shape={tuple(iids.shape)}"
-                            )
-                        if pids is not None:
-                            pids_flat = pids.flatten().tolist()
-                            print(
-                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] position_ids[:15]={pids_flat[:15]} shape={tuple(pids.shape)}"
-                            )
                     yield
         finally:
             if token is not None:
                 _ACTIVE_MANAGER.reset(token)
-
-    def remember_raw_input_ids(self, tensor: Optional[torch.Tensor]) -> None:
-        if tensor is None or not torch.is_tensor(tensor):
-            self._debug_raw_input_ids = None
-            return
-        self._debug_raw_input_ids = tensor.detach().to("cpu").contiguous()
-
-    def consume_raw_input_ids(self) -> Optional[torch.Tensor]:
-        raw = self._debug_raw_input_ids
-        self._debug_raw_input_ids = None
-        return raw
 
     @contextlib.contextmanager
     def replay_context(self):
@@ -1115,35 +982,17 @@ class ContextParallelManager:
 
     def _loss_weight(self, inputs: dict[str, torch.Tensor], reference: torch.Tensor):
         if not isinstance(reference, torch.Tensor):
-            if _cp_debug_enabled():
-                _cp_debug(
-                    f"[CP-DEBUG][focus] _loss_weight: reference is not tensor cp-rank={self._cp_rank_index}"
-                )
             return None
         labels = self._rank_slice(inputs.get("labels"))
         if isinstance(labels, torch.Tensor):
             weight = labels.ne(-100).sum()
-            if _cp_debug_enabled():
-                _cp_debug(
-                    f"[CP-DEBUG][focus] _loss_weight: labels shape={labels.shape} "
-                    f"valid_tokens={weight.item()} cp-rank={self._cp_rank_index}"
-                )
             if weight.item() > 0:
                 return weight.to(device = reference.device, dtype = reference.dtype)
         attention_mask = self._rank_slice(inputs.get("attention_mask"))
         if isinstance(attention_mask, torch.Tensor):
             weight = attention_mask.sum()
-            if _cp_debug_enabled():
-                _cp_debug(
-                    f"[CP-DEBUG][focus] _loss_weight: attention_mask shape={attention_mask.shape} "
-                    f"sum={weight.item()} cp-rank={self._cp_rank_index}"
-                )
             if weight.item() > 0:
                 return weight.to(device = reference.device, dtype = reference.dtype)
-        if _cp_debug_enabled():
-            _cp_debug(
-                f"[CP-DEBUG][focus] _loss_weight: returning None (no valid weight found) cp-rank={self._cp_rank_index}"
-            )
         return None
 
     def _local_valid_token_count(
@@ -1207,65 +1056,7 @@ class ContextParallelManager:
         if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
             return loss
 
-        # Simple loss mode: match accelerate's approach exactly
-        # Just use raw loss for backward, AVG all_reduce for reporting
-        if os.environ.get("UNSLOTH_CP_SIMPLE_LOSS") == "1":
-            if torch.is_tensor(loss):
-                # Clone for reporting (don't modify original gradient graph)
-                report_loss = loss.detach().clone()
-                dist.all_reduce(report_loss, op = dist.ReduceOp.AVG, group = self._cp_group)
-                self._set_report_loss(report_loss)
-                if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
-                    print(
-                        f"[CP-SIMPLE-LOSS][rank={self._cp_rank_index}] "
-                        f"local_loss={loss.item():.6f} avg_loss={report_loss.item():.6f}"
-                    )
-                # Return raw loss for backward (like accelerate)
-                return loss
-            elif isinstance(loss, tuple) and loss and torch.is_tensor(loss[0]):
-                report_loss = loss[0].detach().clone()
-                dist.all_reduce(report_loss, op = dist.ReduceOp.AVG, group = self._cp_group)
-                self._set_report_loss(report_loss)
-                return loss
-            return loss
-
-        # Debug: Check if labels exist in inputs after context manager
-        if _cp_debug_enabled():
-            labels_in = inputs.get("labels")
-            _cp_debug(
-                f"[CP-DEBUG][focus] reduce_loss inputs.labels "
-                f"exists={labels_in is not None} "
-                f"is_tensor={torch.is_tensor(labels_in)} "
-                f"shape={getattr(labels_in, 'shape', None)} "
-                f"cp-rank={self._cp_rank_index}"
-            )
-
         # Enhanced CP Loss Debug
-        if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
-            loss_val = (
-                loss.item()
-                if torch.is_tensor(loss)
-                else (loss[0].item() if isinstance(loss, tuple) else loss)
-            )
-            shift_labels = inputs.get("shift_labels")
-            labels = inputs.get("labels")
-            sl_count = (
-                shift_labels.ne(-100).sum().item()
-                if torch.is_tensor(shift_labels)
-                else None
-            )
-            l_count = labels.ne(-100).sum().item() if torch.is_tensor(labels) else None
-            sl_shape = (
-                tuple(shift_labels.shape) if torch.is_tensor(shift_labels) else None
-            )
-            l_shape = tuple(labels.shape) if torch.is_tensor(labels) else None
-            print(
-                f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss ENTRY: "
-                f"raw_loss={loss_val:.6f} "
-                f"shift_labels_valid={sl_count} shift_labels_shape={sl_shape} "
-                f"labels_valid={l_count} labels_shape={l_shape}"
-            )
-
         def _reduce_tensor(
             tensor: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1309,14 +1100,6 @@ class ContextParallelManager:
             if num_items is None or num_items <= 0:
                 num_items = global_tokens.item()  # fallback to per-batch tokens
 
-            if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
-                print(
-                    f"[CP-REDUCE-DEBUG][rank={self._cp_rank_index}] "
-                    f"local_loss={tensor.item():.6f} local_tokens={local_tokens.item():.0f} "
-                    f"global_tokens={global_tokens.item():.0f} cached_num_items={self._cached_num_items} "
-                    f"num_items={num_items}"
-                )
-
             # Each rank backwards on: local_loss * (local_tokens / num_items_in_batch)
             weight_fraction_for_backward = local_tokens.detach() / num_items
             weighted_loss = tensor * weight_fraction_for_backward
@@ -1328,14 +1111,6 @@ class ContextParallelManager:
                 global_loss_for_report, op = dist.ReduceOp.SUM, group = self._cp_group
             )
 
-            if _cp_debug_enabled():
-                _cp_debug(
-                    f"[CP-DEBUG][focus] _reduce_tensor: "
-                    f"local_loss={tensor.item()} local_tokens={local_tokens.item()} "
-                    f"global_tokens={global_tokens.item()} weighted_loss={weighted_loss.item()} "
-                    f"global_loss={global_loss_for_report.item()} cp-rank={self._cp_rank_index}"
-                )
-
             # Return weighted_loss (for backward) and global_loss (for reporting)
             return weighted_loss, global_loss_for_report, global_tokens
 
@@ -1344,22 +1119,6 @@ class ContextParallelManager:
             # global_loss: used for reporting (same value on all ranks)
             self._set_report_loss(global_loss)
             self._set_report_tokens(global_tokens)
-            if _cp_debug_enabled():
-                _cp_debug(
-                    f"[CP-DEBUG][focus] reduce_loss _finalize: weighted_loss={weighted_loss.item()} "
-                    f"global_loss={global_loss.item()} global_tokens={global_tokens.item()} "
-                    f"cp-rank={self._cp_rank_index}"
-                )
-            # Enhanced CP Loss Debug
-            if (
-                os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1"
-                or os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1"
-            ):
-                print(
-                    f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss: "
-                    f"weighted_loss={weighted_loss.item():.6f} global_loss={global_loss.item():.6f} "
-                    f"global_tokens={global_tokens.item():.1f}"
-                )
             # Return weighted_loss for backward - gradients will be correctly scaled
             return weighted_loss
 
@@ -1633,32 +1392,6 @@ def _patch_sft_trainer(trl_module) -> None:
                 # num_items_in_batch not provided (model signature check may have failed)
                 # This can happen when unsloth's _unsloth_get_batch_samples determines
                 # the model doesn't accept **kwargs. Debug to understand why.
-                if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
-                    rank = dist.get_rank() if dist.is_initialized() else 0
-                    # Check model structure to understand signature check failure
-                    m = model
-                    if hasattr(m, "get_base_model"):
-                        m = m.get_base_model()
-                    model_class = m.__class__.__name__
-                    forward_qualname = getattr(m.forward, "__qualname__", "N/A")
-                    import inspect
-
-                    try:
-                        sig = inspect.signature(m.forward)
-                        last_param = (
-                            list(sig.parameters.values())[-1]
-                            if sig.parameters
-                            else None
-                        )
-                        last_param_kind = last_param.kind if last_param else None
-                        has_kwargs = last_param_kind == inspect.Parameter.VAR_KEYWORD
-                    except:
-                        has_kwargs = "error"
-                    print(
-                        f"[CP-GA-DEBUG][rank={rank}] num_items_in_batch=None! "
-                        f"model_class={model_class} forward_qualname={forward_qualname} "
-                        f"has_kwargs={has_kwargs}"
-                    )
                 # Fallback: compute from labels (approximation for GA)
                 labels = inputs.get("labels")
                 if isinstance(labels, torch.Tensor):
@@ -1672,39 +1405,8 @@ def _patch_sft_trainer(trl_module) -> None:
                     manager._cached_num_items = local_count.item() * ga_steps
 
             # Debug: verify num_items_in_batch and dataset items
-            if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                input_ids = inputs.get("input_ids")
-                # Get first few tokens as identifier (before sharding)
-                id_preview = None
-                id_shape = None
-                if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0:
-                    id_preview = input_ids.flatten()[:8].tolist()
-                    id_shape = tuple(input_ids.shape)
-                print(
-                    f"[CP-GA-DEBUG][rank={rank}] num_items_in_batch={num_items_val} "
-                    f"cached={manager._cached_num_items} ga_steps={manager._cached_ga_steps} "
-                    f"input_ids_shape={id_shape} input_ids_preview={id_preview}"
-                )
-
             kwargs.pop("num_items_in_batch", None)
             inputs.pop("num_items_in_batch", None)
-        elif os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
-            # Debug for CP=1 case (no manager or not enabled)
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            num_items_val = kwargs.get("num_items_in_batch")
-            input_ids = inputs.get("input_ids")
-            id_preview = None
-            if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0:
-                id_preview = input_ids.flatten()[:8].tolist()
-            ga_steps = getattr(
-                getattr(self, "args", None), "gradient_accumulation_steps", 1
-            )
-            print(
-                f"[CP-GA-DEBUG][rank={rank}][CP=1] num_items_in_batch={num_items_val} "
-                f"ga_steps={ga_steps} input_ids_preview={id_preview}"
-            )
-
         # One-time sanity check to verify model outputs match between CP and non-CP
         if (
             manager
@@ -1718,33 +1420,6 @@ def _patch_sft_trainer(trl_module) -> None:
             except Exception as e:
                 print(f"[CP-SANITY] Error running sanity check: {e}")
 
-        if (
-            manager
-            and os.environ.get("UNSLOTH_CP_DUMP_BATCH") == "1"
-            and isinstance(inputs.get("input_ids"), torch.Tensor)
-        ):
-            manager.remember_raw_input_ids(inputs["input_ids"])
-        if _cp_debug_enabled():
-            ids_pre = inputs.get("input_ids")
-            preview_pre = (
-                ids_pre[0][: min(ids_pre.shape[-1], 16)].tolist()
-                if isinstance(ids_pre, torch.Tensor)
-                else None
-            )
-            _cp_debug(
-                f"[CP-DEBUG] pre-apply input_ids shape={getattr(ids_pre, 'shape', None)} preview={preview_pre}"
-            )
-            if os.environ.get("UNSLOTH_CP_DUMP_BATCH") == "1":
-                rank_pre = dist.get_rank() if dist.is_initialized() else 0
-                gathered = inputs.get("input_ids")
-                if isinstance(gathered, torch.Tensor):
-                    tokens = gathered.detach().cpu().flatten().tolist()
-                    chunk = 64
-                    for start in range(0, len(tokens), chunk):
-                        end = min(start + chunk, len(tokens))
-                        _cp_debug(
-                            f"[CP-DEBUG][focus] raw-input_ids rank={rank_pre} idx={start}:{end} tokens={tokens[start:end]}"
-                        )
         context = manager.apply(inputs) if manager else contextlib.nullcontext()
         with context:
             if manager:
@@ -1755,44 +1430,6 @@ def _patch_sft_trainer(trl_module) -> None:
             if dist.is_initialized():
                 rank = dist.get_rank()
             # Enhanced CP Loss Debug
-            if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
-                num_items = kwargs.get("num_items_in_batch")
-                num_items_val = (
-                    num_items.item() if torch.is_tensor(num_items) else num_items
-                )
-                ids = inputs.get("input_ids")
-                labels = inputs.get("labels")
-                shift_labels = inputs.get("shift_labels")
-                ids_shape = tuple(ids.shape) if torch.is_tensor(ids) else None
-                labels_shape = tuple(labels.shape) if torch.is_tensor(labels) else None
-                sl_shape = (
-                    tuple(shift_labels.shape) if torch.is_tensor(shift_labels) else None
-                )
-                labels_valid = (
-                    labels.ne(-100).sum().item() if torch.is_tensor(labels) else None
-                )
-                sl_valid = (
-                    shift_labels.ne(-100).sum().item()
-                    if torch.is_tensor(shift_labels)
-                    else None
-                )
-                print(
-                    f"[CP-LOSS-DEBUG][rank={rank}] patched_compute_loss: "
-                    f"num_items_in_batch={num_items_val} "
-                    f"input_ids_shape={ids_shape} labels_shape={labels_shape} shift_labels_shape={sl_shape} "
-                    f"labels_valid={labels_valid} shift_labels_valid={sl_valid}"
-                )
-            if _cp_debug_enabled():
-                ids = inputs.get("input_ids")
-                preview = (
-                    ids[0][: min(ids.shape[-1], 16)].tolist()
-                    if isinstance(ids, torch.Tensor)
-                    else None
-                )
-                _cp_debug(
-                    f"[CP-DEBUG][rank={rank}] before loss input_ids shape={getattr(ids, 'shape', None)} preview={preview}"
-                )
-
             # For context parallelism with shift_labels, prefer letting the model
             # handle the pre-shifted targets when it advertises support. Otherwise
             # fall back to an external loss that consumes the sharded tensors.
@@ -1809,41 +1446,15 @@ def _patch_sft_trainer(trl_module) -> None:
             )
 
             # Debug: trace the compute_loss path
-            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                print(
-                    f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] use_cp_shift_labels={use_cp_shift_labels} "
-                    f"model_supports_shift_labels={model_supports_shift_labels} "
-                    f"model_class={model.__class__.__name__}"
-                )
-
             if use_cp_shift_labels and not model_supports_shift_labels:
                 # Remove labels so model doesn't compute loss internally
                 saved_labels = inputs.pop("labels", None)
                 # Also remove shift_labels from inputs (model doesn't expect it)
                 local_shift_labels = inputs.pop("shift_labels", None)
 
-                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                    print(
-                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] EXTERNAL LOSS PATH: shift_labels shape={local_shift_labels.shape if local_shift_labels is not None else None}"
-                    )
-
                 # Get model outputs (logits only, no loss)
                 outputs = model(**inputs)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-
-                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                    print(
-                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] logits shape={tuple(logits.shape)} shift_labels shape={tuple(local_shift_labels.shape)}"
-                    )
-                    # Check first few logits argmax vs labels
-                    argmax_preds = logits[0, :5].argmax(dim = -1).tolist()
-                    labels_preview = local_shift_labels[0, :5].tolist()
-                    print(
-                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] First 5 predictions (argmax): {argmax_preds}"
-                    )
-                    print(
-                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] First 5 labels: {labels_preview}"
-                    )
 
                 # Compute loss using pre-shifted labels
                 # No additional shifting needed - shift_labels already contains
@@ -1855,22 +1466,6 @@ def _patch_sft_trainer(trl_module) -> None:
                     logits = logits,
                     labels = local_shift_labels,
                 )
-
-                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                    valid_tokens = (
-                        (local_shift_labels != -100).sum().item()
-                        if local_shift_labels is not None
-                        else 0
-                    )
-                    print(
-                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] EXTERNAL LOSS: loss={loss.item():.6f} valid_tokens={valid_tokens}"
-                    )
-
-                if _cp_debug_enabled():
-                    _cp_debug(
-                        f"[CP-DEBUG][focus][rank={rank}] external loss: logits shape={logits.shape} "
-                        f"shift_labels shape={shift_labels.shape} loss={loss.item()}"
-                    )
 
                 # Restore labels for reduce_loss token counting
                 if saved_labels is not None:
@@ -1888,27 +1483,9 @@ def _patch_sft_trainer(trl_module) -> None:
                     return_outputs = return_outputs,
                     **kwargs,
                 )
-        if _cp_debug_enabled():
-            _cp_debug(f"[CP-DEBUG][rank={rank}] raw loss={loss}")
-
         # Log CP=1 losses for comparison with CP=2
-        if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
-            loss_val = loss[0].item() if isinstance(loss, tuple) else loss.item()
-            labels = inputs.get("labels")
-            if isinstance(labels, torch.Tensor):
-                valid_tokens = (labels[..., 1:] != -100).sum().item()
-            else:
-                valid_tokens = "N/A"
-            if not manager or not manager.enabled:
-                print(
-                    f"[CP-LOSS-DEBUG][rank={rank}][CP=1] loss={loss_val:.6f} "
-                    f"valid_tokens={valid_tokens}"
-                )
-
         if manager and manager.enabled:
             loss = manager.reduce_loss(loss, inputs)
-        if _cp_debug_enabled():
-            _cp_debug(f"[CP-DEBUG][rank={rank}] reduced loss={loss}")
         return loss
 
     @functools.wraps(original_prediction_step)
@@ -2028,11 +1605,3 @@ def _patch_sft_trainer(trl_module) -> None:
         trainer_cls._get_train_sampler = _patch_train_sampler(
             original_get_train_sampler
         )
-
-
-def _cp_debug_enabled() -> bool:
-    return False
-
-
-def _cp_debug(msg: str) -> None:
-    return
