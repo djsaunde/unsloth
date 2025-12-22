@@ -488,6 +488,7 @@ class ContextParallelManager:
         self._world_size: int = 1
         self._no_restore_lookup = set(settings.no_restore_buffer_names)
         self._cached_num_items: Optional[torch.Tensor | float | int] = None
+        self._cached_ga_steps: int = 1
         self._report_loss: Optional[torch.Tensor] = None
         self._report_tokens: Optional[torch.Tensor] = None
         self._last_global_seq_len: Optional[int] = None
@@ -962,28 +963,38 @@ class ContextParallelManager:
             # If num_items_in_batch was cached (from gradient accumulation), use it
             # instead of the computed global tokens. This ensures correct loss scaling
             # when gradient_accumulation_steps > 1.
+            #
+            # When num_items_in_batch is present, HF Trainer multiplies loss by GA before
+            # backward to counter accelerate's internal division. Since we removed
+            # num_items_in_batch from inputs, training_step will instead divide by GA.
+            # We pre-multiply by GA here to counter that division.
             denominator = tokens
+            ga_multiplier = 1
             if self._cached_num_items is not None and self._cached_num_items > 0:
                 denominator = torch.tensor(
                     self._cached_num_items,
                     dtype = summed.dtype,
                     device = summed.device,
                 )
+                # Get GA steps to counter the division in training_step
+                ga_multiplier = getattr(self, "_cached_ga_steps", 1)
             normalized = summed / torch.clamp(denominator, min = eps)
+            if ga_multiplier > 1:
+                normalized = normalized * ga_multiplier
             self._set_report_loss(normalized)
             self._set_report_tokens(tokens)
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] reduce_loss _finalize: summed={summed.item()} tokens={tokens.item()} "
                     f"cached_num_items={self._cached_num_items} denominator={denominator.item()} "
-                    f"normalized={normalized.item()} cp-rank={self._cp_rank_index}"
+                    f"ga_multiplier={ga_multiplier} normalized={normalized.item()} cp-rank={self._cp_rank_index}"
                 )
             # Enhanced CP Loss Debug
             if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
                 print(
                     f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss FINAL: "
                     f"global_sum={summed.item():.6f} global_tokens={tokens.item():.1f} "
-                    f"cached_num_items={self._cached_num_items} "
+                    f"cached_num_items={self._cached_num_items} ga_multiplier={ga_multiplier} "
                     f"normalized_loss={normalized.item():.6f}"
                 )
             return normalized
@@ -1226,8 +1237,21 @@ def _patch_sft_trainer(trl_module) -> None:
     @functools.wraps(original_compute_loss)
     def patched_compute_loss(self, model, inputs, return_outputs = False, **kwargs):
         manager = getattr(self, "_context_parallel_manager", None)
-        # Remove num_items_in_batch when CP is enabled - model should use local token count
+        # Cache num_items_in_batch and GA steps for reduce_loss, then remove from inputs
+        # so model uses local token count
         if manager and manager.enabled:
+            # Cache gradient accumulation steps for reduce_loss
+            manager._cached_ga_steps = getattr(
+                getattr(self, "args", None), "gradient_accumulation_steps", 1
+            )
+            # Cache num_items_in_batch before removing (done in _adjust_num_items_in_batch,
+            # but also handle if it's in kwargs)
+            if "num_items_in_batch" in kwargs:
+                value = kwargs.get("num_items_in_batch")
+                if value is not None and manager._cached_num_items is None:
+                    manager._cached_num_items = (
+                        value.item() if torch.is_tensor(value) else value
+                    )
             kwargs.pop("num_items_in_batch", None)
             inputs.pop("num_items_in_batch", None)
 
