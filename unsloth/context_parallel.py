@@ -935,19 +935,25 @@ class ContextParallelManager:
                         1.0, dtype = tensor.dtype, device = tensor.device
                     )
 
-            # Get global token count WITHOUT gradients - just for normalization
+            # Get global token count WITHOUT gradients
             global_tokens = local_tokens.detach().clone()
             dist.all_reduce(global_tokens, op = dist.ReduceOp.SUM, group = self._cp_group)
 
-            # Scale local loss by its weight contribution.
-            # Each rank backwards on: local_loss * (local_tokens / global_tokens)
-            # This ensures gradients are correctly weighted.
-            weight_fraction = local_tokens.detach() / global_tokens
-            weighted_loss = tensor * weight_fraction
+            # For backward: scale by local_tokens / num_items_in_batch (total across GA)
+            # This matches CP=1 which divides by num_items_in_batch for each micro-batch.
+            # For logging: use global_tokens (per-batch mean) to show meaningful loss.
+            num_items = self._cached_num_items
+            if num_items is None or num_items <= 0:
+                num_items = global_tokens.item()  # fallback to per-batch tokens
 
-            # All-reduce to get the global weighted mean for reporting
-            # Use a detached copy so all_reduce doesn't affect gradient flow
-            global_loss_for_report = weighted_loss.detach().clone()
+            # Each rank backwards on: local_loss * (local_tokens / num_items_in_batch)
+            weight_fraction_for_backward = local_tokens.detach() / num_items
+            weighted_loss = tensor * weight_fraction_for_backward
+
+            # For reporting: compute global mean (sum(CE) / global_tokens)
+            weight_fraction_for_report = local_tokens.detach() / global_tokens
+            local_contribution = tensor.detach() * weight_fraction_for_report
+            global_loss_for_report = local_contribution.clone()
             dist.all_reduce(
                 global_loss_for_report, op = dist.ReduceOp.SUM, group = self._cp_group
             )
