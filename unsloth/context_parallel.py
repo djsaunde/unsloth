@@ -1439,14 +1439,12 @@ def _patch_sft_trainer(trl_module) -> None:
                 # Compute loss using pre-shifted labels
                 # No additional shifting needed - shift_labels already contains
                 # the correct "next token" for each position after sharding
-                from torch.nn import CrossEntropyLoss
+                # Use unsloth's fast CE for numerical consistency with CP=1
+                from unsloth.kernels.cross_entropy_loss import fast_cross_entropy_loss
 
-                loss_fct = CrossEntropyLoss()
-                # Flatten for loss computation
-                vocab_size = logits.size(-1)
-                loss = loss_fct(
-                    logits.view(-1, vocab_size),
-                    local_shift_labels.view(-1),
+                loss = fast_cross_entropy_loss(
+                    logits = logits,
+                    labels = local_shift_labels,
                 )
 
                 if _cp_debug_enabled():
