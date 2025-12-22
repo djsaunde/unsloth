@@ -1542,6 +1542,17 @@ def _patch_sft_trainer(trl_module) -> None:
                     "checkpointing + gradient accumulation compatibility."
                 )
 
+    def _all_reduce_gradients_cp(model, cp_group):
+        """All-reduce gradients across CP group after backward.
+
+        In pure CP mode (no DDP), each rank computes gradients from its local
+        loss on its local sequence shard. These partial gradients must be summed
+        across the CP group to get the correct total gradient.
+        """
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op = dist.ReduceOp.SUM, group = cp_group)
+
     @functools.wraps(original_training_step)
     def patched_training_step(self, *args, **kwargs):
         manager = getattr(self, "_context_parallel_manager", None)
@@ -1554,6 +1565,22 @@ def _patch_sft_trainer(trl_module) -> None:
             # sync_each_batch keeps the graph constant instead.
         try:
             loss = original_training_step(self, *args, **kwargs)
+
+            # In pure CP mode (dp_world_size=1), gradients need to be all-reduced
+            # across the CP group. Each rank computed gradients from its local
+            # loss on its sequence shard - sum them to get total gradient.
+            if (
+                manager
+                and manager.enabled
+                and manager.data_parallel_world_size == 1
+                and manager._cp_group is not None
+            ):
+                _all_reduce_gradients_cp(self.model, manager._cp_group)
+                if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    print(
+                        f"[CP-GRAD-DEBUG][rank={rank}] All-reduced gradients across CP group"
+                    )
         finally:
             if manager:
                 setattr(self.args, "_n_gpu", original_n_gpu)
