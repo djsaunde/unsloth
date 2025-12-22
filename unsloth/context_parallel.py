@@ -502,12 +502,6 @@ def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
         if name.endswith("self_attn"):
             attn_modules.append((name, module))
 
-    if debug and int(os.environ.get("RANK", "0")) == 0:
-        print(f"[CP-HOOK-DEBUG] Model type: {type(model).__name__}")
-        print(f"[CP-HOOK-DEBUG] Found {len(attn_modules)} self_attn modules")
-        if attn_modules:
-            print(f"[CP-HOOK-DEBUG] First module: {attn_modules[0][0]}")
-
     for name, module in attn_modules:
         handle = module.register_forward_pre_hook(
             _self_attn_pre_forward_hook, with_kwargs = True, prepend = True
@@ -855,7 +849,6 @@ class ContextParallelManager:
         padded = F.pad(labels, (0, 1), value = ignore_index)
         shift_labels = padded[:, 1:].contiguous()
         inputs["shift_labels"] = shift_labels
-        # Load balancing debug: log shift_labels BEFORE reordering
 
     def _debug_validate_buffers(
         self,
@@ -922,7 +915,6 @@ class ContextParallelManager:
                         buffer.resize_(chunk.shape)
                         buffer.copy_(chunk)
 
-                    # Load balancing debug: log values AFTER sharding
                     yield
 
                     # Defer buffer restoration to exit_sdpa_patch()
@@ -949,7 +941,6 @@ class ContextParallelManager:
                     buffer_seq_dims = seq_dims,
                     no_restore_buffers = no_restore,
                 ):
-                    # Load balancing debug: log values AFTER sharding
                     yield
         finally:
             if token is not None:
