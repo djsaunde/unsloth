@@ -1463,11 +1463,24 @@ def _patch_sft_trainer(trl_module) -> None:
                 )
             )
 
+            # Debug: trace the compute_loss path
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                print(
+                    f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] use_cp_shift_labels={use_cp_shift_labels} "
+                    f"model_supports_shift_labels={model_supports_shift_labels} "
+                    f"model_class={model.__class__.__name__}"
+                )
+
             if use_cp_shift_labels and not model_supports_shift_labels:
                 # Remove labels so model doesn't compute loss internally
                 saved_labels = inputs.pop("labels", None)
                 # Also remove shift_labels from inputs (model doesn't expect it)
                 local_shift_labels = inputs.pop("shift_labels", None)
+
+                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                    print(
+                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] EXTERNAL LOSS PATH: shift_labels shape={local_shift_labels.shape if local_shift_labels is not None else None}"
+                    )
 
                 # Get model outputs (logits only, no loss)
                 outputs = model(**inputs)
@@ -1483,6 +1496,16 @@ def _patch_sft_trainer(trl_module) -> None:
                     logits = logits,
                     labels = local_shift_labels,
                 )
+
+                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                    valid_tokens = (
+                        (local_shift_labels != -100).sum().item()
+                        if local_shift_labels is not None
+                        else 0
+                    )
+                    print(
+                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] EXTERNAL LOSS: loss={loss.item():.6f} valid_tokens={valid_tokens}"
+                    )
 
                 if _cp_debug_enabled():
                     _cp_debug(
