@@ -1468,7 +1468,22 @@ def _patch_sft_trainer(trl_module) -> None:
                 )
         if _cp_debug_enabled():
             _cp_debug(f"[CP-DEBUG][rank={rank}] raw loss={loss}")
-        if manager:
+
+        # Log CP=1 losses for comparison with CP=2
+        if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
+            loss_val = loss[0].item() if isinstance(loss, tuple) else loss.item()
+            labels = inputs.get("labels")
+            if isinstance(labels, torch.Tensor):
+                valid_tokens = (labels[..., 1:] != -100).sum().item()
+            else:
+                valid_tokens = "N/A"
+            if not manager or not manager.enabled:
+                print(
+                    f"[CP-LOSS-DEBUG][rank={rank}][CP=1] loss={loss_val:.6f} "
+                    f"valid_tokens={valid_tokens}"
+                )
+
+        if manager and manager.enabled:
             loss = manager.reduce_loss(loss, inputs)
         if _cp_debug_enabled():
             _cp_debug(f"[CP-DEBUG][rank={rank}] reduced loss={loss}")
