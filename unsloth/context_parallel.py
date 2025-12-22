@@ -829,12 +829,13 @@ class ContextParallelManager:
         # Then reduce_loss correctly recovers: scaled = loss * local_count = local_sum
         # The final reduction uses the CACHED num_items_in_batch (total across GA steps)
         # for proper gradient accumulation: global_sum / num_items_in_batch
-        self._cached_num_items = None
+        # Note: Don't reset _cached_num_items if already set (may have been cached from kwargs
+        # in patched_compute_loss before this is called)
         if not self.enabled or "num_items_in_batch" not in inputs:
             return
-        # Cache the global value for use in reduce_loss
+        # Cache the global value for use in reduce_loss (only if not already cached)
         value = inputs.get("num_items_in_batch")
-        if value is not None:
+        if value is not None and self._cached_num_items is None:
             self._cached_num_items = value.item() if torch.is_tensor(value) else value
         # Remove so model uses local token count
         inputs.pop("num_items_in_batch", None)
@@ -1240,15 +1241,16 @@ def _patch_sft_trainer(trl_module) -> None:
         # Cache num_items_in_batch and GA steps for reduce_loss, then remove from inputs
         # so model uses local token count
         if manager and manager.enabled:
+            # Reset cached values from previous step
+            manager._cached_num_items = None
             # Cache gradient accumulation steps for reduce_loss
             manager._cached_ga_steps = getattr(
                 getattr(self, "args", None), "gradient_accumulation_steps", 1
             )
-            # Cache num_items_in_batch before removing (done in _adjust_num_items_in_batch,
-            # but also handle if it's in kwargs)
+            # Cache num_items_in_batch before removing
             if "num_items_in_batch" in kwargs:
                 value = kwargs.get("num_items_in_batch")
-                if value is not None and manager._cached_num_items is None:
+                if value is not None:
                     manager._cached_num_items = (
                         value.item() if torch.is_tensor(value) else value
                     )
