@@ -2416,6 +2416,49 @@ def CausalLM_fast_forward(fast_forward_inference):
                 _cp_debug(
                     f"[CP-DEBUG][loss-input labels] valid_tokens={valid.sum().item()} checksum={label_sum:.6f}"
                 )
+            # Load balancing debug: sample predictions vs targets and per-position losses
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1" and torch.is_tensor(
+                shift_logits
+            ):
+                import torch.distributed as _dist_lb
+
+                _rank_lb = _dist_lb.get_rank() if _dist_lb.is_initialized() else 0
+                # Sample a few positions
+                positions_to_check = [0, 5, 10, 15, 20, 25]
+                for pos in positions_to_check:
+                    if pos < shift_logits.size(1):
+                        pred = shift_logits[0, pos].argmax().item()
+                        target = loss_shift_labels[0, pos].item()
+                        # Compute per-position loss
+                        if target != -100:
+                            pos_loss = F.cross_entropy(
+                                shift_logits[0, pos : pos + 1],
+                                loss_shift_labels[0, pos : pos + 1],
+                                reduction = "mean",
+                            ).item()
+                        else:
+                            pos_loss = -1  # ignored
+                        print(
+                            f"[CP-LB-DEBUG][LOSS][rank={_rank_lb}] pos={pos} pred={pred} target={target} loss={pos_loss:.4f}"
+                        )
+                # Also show top-5 highest loss positions
+                if loss_shift_labels.size(1) > 0:
+                    with torch.no_grad():
+                        per_pos_loss = F.cross_entropy(
+                            shift_logits[0].float(),
+                            loss_shift_labels[0],
+                            reduction = "none",
+                        )
+                        # Find top losses (excluding ignored positions)
+                        valid_mask = loss_shift_labels[0].ne(-100)
+                        per_pos_loss_masked = per_pos_loss.clone()
+                        per_pos_loss_masked[~valid_mask] = -1
+                        top_losses, top_indices = per_pos_loss_masked.topk(
+                            min(5, valid_mask.sum().item())
+                        )
+                        print(
+                            f"[CP-LB-DEBUG][LOSS][rank={_rank_lb}] TOP-5 losses: {[(idx.item(), loss.item()) for idx, loss in zip(top_indices, top_losses)]}"
+                        )
             loss = fast_cross_entropy_loss(
                 logits = shift_logits,
                 labels = loss_shift_labels,

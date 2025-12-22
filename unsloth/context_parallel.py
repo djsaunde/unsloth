@@ -676,6 +676,14 @@ class ContextParallelManager:
             _cp_debug(
                 f"[CP-DEBUG][cp-rank={self._cp_rank_index}] synthesized shift_labels preview={preview}"
             )
+        # Load balancing debug: log shift_labels BEFORE reordering
+        if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+            sl_flat = shift_labels.flatten().tolist()
+            lbl_flat = labels.flatten().tolist()
+            print(
+                f"[CP-LB-DEBUG][BEFORE-REORDER] labels[:20]={lbl_flat[:20]} "
+                f"shift_labels[:20]={sl_flat[:20]} seq_len={labels.size(1)}"
+            )
 
     def _debug_validate_buffers(
         self,
@@ -731,6 +739,27 @@ class ContextParallelManager:
                 buffer_seq_dims = seq_dims,
                 no_restore_buffers = no_restore,
             ):
+                # Load balancing debug: log values AFTER sharding
+                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                    _rank = self._cp_rank_index
+                    sl = inputs.get("shift_labels")
+                    iids = inputs.get("input_ids")
+                    pids = inputs.get("position_ids")
+                    if sl is not None:
+                        sl_flat = sl.flatten().tolist()
+                        print(
+                            f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] shift_labels[:15]={sl_flat[:15]} shape={tuple(sl.shape)}"
+                        )
+                    if iids is not None:
+                        iids_flat = iids.flatten().tolist()
+                        print(
+                            f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] input_ids[:15]={iids_flat[:15]} shape={tuple(iids.shape)}"
+                        )
+                    if pids is not None:
+                        pids_flat = pids.flatten().tolist()
+                        print(
+                            f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] position_ids[:15]={pids_flat[:15]} shape={tuple(pids.shape)}"
+                        )
                 yield
         finally:
             if token is not None:
