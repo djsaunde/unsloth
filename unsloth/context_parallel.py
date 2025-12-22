@@ -8,7 +8,6 @@ from typing import Iterator, Optional, Tuple
 import sys
 import os
 import contextvars
-import hashlib
 
 import torch
 import torch.nn.functional as F
@@ -47,301 +46,6 @@ def get_active_context_parallel_manager() -> Optional["ContextParallelManager"]:
 def is_context_parallel_active() -> bool:
     manager = get_active_context_parallel_manager()
     return bool(manager and manager.enabled)
-
-
-def _run_cp_sanity_check(model, manager) -> None:
-    """
-    One-time sanity check to verify model outputs are consistent across CP ranks.
-    Run with UNSLOTH_CP_SANITY_CHECK=1 to enable.
-    """
-    if not dist.is_initialized():
-        return
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    # Create identical test input on all ranks
-    torch.manual_seed(42)
-    seq_len = 32 * manager.settings.size  # Ensure divisible by CP size
-    test_input = torch.randint(100, 1000, (1, seq_len), device = "cuda")
-
-    # Broadcast from rank 0 to ensure identical input
-    dist.broadcast(test_input, src = 0)
-
-    print(
-        f"[CP-SANITY][rank={rank}] Running sanity check with input shape {test_input.shape}"
-    )
-
-    # Run model WITHOUT context parallel to get reference output
-    # Force SDPA path by temporarily disabling Flash Attention
-    # This ensures reference and CP runs use the same attention implementation
-    import unsloth.models.llama as llama_module
-
-    original_has_flash = getattr(llama_module, "HAS_FLASH_ATTENTION", False)
-    llama_module.HAS_FLASH_ATTENTION = False
-    print(f"[CP-SANITY][rank={rank}] Disabled Flash Attention for fair comparison")
-
-    # Create position_ids for reference too (ensures same RoPE code path)
-    full_pos = torch.arange(seq_len, device = "cuda").unsqueeze(0)
-
-    model.eval()
-    with torch.no_grad():
-        # Capture layer outputs for debugging
-        layer_outputs_ref = {}
-
-        def make_hook(name, storage):
-            def hook(module, input, output):
-                if isinstance(output, tuple):
-                    out = output[0]
-                else:
-                    out = output
-                storage[name] = out.detach().clone()
-
-            return hook
-
-        def make_pre_hook(name, storage):
-            def hook(module, input):
-                if isinstance(input, tuple) and len(input) > 0:
-                    inp = input[0]
-                else:
-                    inp = input
-                if isinstance(inp, torch.Tensor):
-                    storage[name] = inp.detach().clone()
-
-            return hook
-
-        # Register hooks on first few layers
-        hooks = []
-        # Navigate to the inner model (handles PEFT wrapping, etc.)
-        base_model = model
-        print(f"[CP-SANITY][rank={rank}] model type: {type(model).__name__}")
-        if hasattr(model, "model"):
-            print(
-                f"[CP-SANITY][rank={rank}] model.model type: {type(model.model).__name__}"
-            )
-            if hasattr(model.model, "model"):
-                print(
-                    f"[CP-SANITY][rank={rank}] model.model.model type: {type(model.model.model).__name__}"
-                )
-                base_model = model.model.model
-            elif hasattr(model.model, "layers"):
-                base_model = model.model
-        print(f"[CP-SANITY][rank={rank}] base_model type: {type(base_model).__name__}")
-        print(
-            f"[CP-SANITY][rank={rank}] has embed_tokens: {hasattr(base_model, 'embed_tokens')}"
-        )
-        print(f"[CP-SANITY][rank={rank}] has layers: {hasattr(base_model, 'layers')}")
-        if hasattr(base_model, "embed_tokens"):
-            hooks.append(
-                base_model.embed_tokens.register_forward_hook(
-                    make_hook("embed", layer_outputs_ref)
-                )
-            )
-        if hasattr(base_model, "layers") and len(base_model.layers) > 0:
-            hooks.append(
-                base_model.layers[0].register_forward_hook(
-                    make_hook("layer0", layer_outputs_ref)
-                )
-            )
-            # Also hook the attention module inside layer 0
-            if hasattr(base_model.layers[0], "self_attn"):
-                hooks.append(
-                    base_model.layers[0].self_attn.register_forward_pre_hook(
-                        make_pre_hook("layer0_attn_in", layer_outputs_ref)
-                    )
-                )
-                hooks.append(
-                    base_model.layers[0].self_attn.register_forward_hook(
-                        make_hook("layer0_attn", layer_outputs_ref)
-                    )
-                )
-            # And the input layernorm
-            if hasattr(base_model.layers[0], "input_layernorm"):
-                hooks.append(
-                    base_model.layers[0].input_layernorm.register_forward_hook(
-                        make_hook("layer0_ln", layer_outputs_ref)
-                    )
-                )
-        print(f"[CP-SANITY][rank={rank}] Registered {len(hooks)} hooks")
-
-        ref_output = model(test_input, position_ids = full_pos.clone())
-        ref_logits = ref_output.logits
-        ref_sum = ref_logits.sum().item()
-        ref_first = ref_logits[0, 0, :5].tolist()
-
-        # Remove hooks
-        for h in hooks:
-            h.remove()
-
-        # Log reference layer checksums
-        print(
-            f"[CP-SANITY][rank={rank}] layer_outputs_ref keys: {list(layer_outputs_ref.keys())}"
-        )
-        for name, tensor in layer_outputs_ref.items():
-            checksum = tensor.float().sum().item()
-            print(
-                f"[CP-SANITY][rank={rank}] REF {name}: shape={tuple(tensor.shape)} checksum={checksum:.4f}"
-            )
-
-        print(
-            f"[CP-SANITY][rank={rank}] Reference (no CP, SDPA): logits_sum={ref_sum:.4f} first_5={[f'{x:.4f}' for x in ref_first]}"
-        )
-
-        # Now run WITH context parallel
-        # DON'T manually shard - let context_parallel do it!
-
-        # Check if model is compiled (torch.compile can bypass TorchFunctionMode)
-        is_compiled = hasattr(model, "_orig_mod") or hasattr(model, "__wrapped__")
-        print(f"[CP-SANITY][rank={rank}] Model is_compiled={is_compiled}")
-
-        # Try to detect if ring attention will be used
-        try:
-            from torch.distributed.tensor.experimental._attention import _cp_options
-
-            print(
-                f"[CP-SANITY][rank={rank}] CP options: enable_load_balance={_cp_options.enable_load_balance}"
-            )
-        except Exception as e:
-            print(f"[CP-SANITY][rank={rank}] Could not check CP options: {e}")
-
-        # Pass FULL tensors to context_parallel - it will shard them
-        buffers = [test_input, full_pos]
-        print(
-            f"[CP-SANITY][rank={rank}] Passing full input shape={tuple(test_input.shape)} to context_parallel"
-        )
-
-        # Set the global seq_len so position_ids adjustment in the model works correctly
-        manager._last_global_seq_len = seq_len
-
-        with context_parallel(
-            manager._mesh,
-            buffers = buffers,
-            buffer_seq_dims = [1, 1],
-            no_restore_buffers = set(buffers),
-        ):
-            # IMPORTANT: Also set unsloth's _ACTIVE_MANAGER so cp_active is True
-            # This ensures unsloth uses SDPA (which gets intercepted by ring attention)
-            # instead of Flash Attention (which would bypass ring attention).
-            with manager.replay_context():
-                # Check if SDPA function is patched
-                import torch.nn.functional as _F
-
-                _sdpa_fn = _F.scaled_dot_product_attention
-                print(
-                    f"[CP-SANITY][rank={rank}] SDPA function: {_sdpa_fn.__name__ if hasattr(_sdpa_fn, '__name__') else type(_sdpa_fn)}"
-                )
-                print(
-                    f"[CP-SANITY][rank={rank}] SDPA function module: {_sdpa_fn.__module__ if hasattr(_sdpa_fn, '__module__') else 'N/A'}"
-                )
-                # After entering context, buffers are sharded in-place
-                print(
-                    f"[CP-SANITY][rank={rank}] Inside context_parallel, input now shape={tuple(test_input.shape)}"
-                )
-                print(
-                    f"[CP-SANITY][rank={rank}] position_ids shape={tuple(full_pos.shape)} values={full_pos[0, :8].tolist()}...{full_pos[0, -4:].tolist()}"
-                )
-                print(
-                    f"[CP-SANITY][rank={rank}] input_ids first 8: {test_input[0, :8].tolist()}"
-                )
-                print(
-                    f"[CP-SANITY][rank={rank}] cp_active check: manager.enabled={manager.enabled}"
-                )
-
-                # Register hooks for CP run
-                layer_outputs_cp = {}
-                hooks_cp = []
-                if hasattr(base_model, "embed_tokens"):
-                    hooks_cp.append(
-                        base_model.embed_tokens.register_forward_hook(
-                            make_hook("embed", layer_outputs_cp)
-                        )
-                    )
-                if hasattr(base_model, "layers") and len(base_model.layers) > 0:
-                    hooks_cp.append(
-                        base_model.layers[0].register_forward_hook(
-                            make_hook("layer0", layer_outputs_cp)
-                        )
-                    )
-                    # Also hook the attention module inside layer 0
-                    if hasattr(base_model.layers[0], "self_attn"):
-                        hooks_cp.append(
-                            base_model.layers[0].self_attn.register_forward_pre_hook(
-                                make_pre_hook("layer0_attn_in", layer_outputs_cp)
-                            )
-                        )
-                        hooks_cp.append(
-                            base_model.layers[0].self_attn.register_forward_hook(
-                                make_hook("layer0_attn", layer_outputs_cp)
-                            )
-                        )
-                    # And the input layernorm
-                    if hasattr(base_model.layers[0], "input_layernorm"):
-                        hooks_cp.append(
-                            base_model.layers[0].input_layernorm.register_forward_hook(
-                                make_hook("layer0_ln", layer_outputs_cp)
-                            )
-                        )
-
-                cp_output = model(input_ids = test_input, position_ids = full_pos)
-                cp_logits = cp_output.logits
-                local_sum = cp_logits.sum()
-
-                # Remove hooks
-                for h in hooks_cp:
-                    h.remove()
-
-                # Log CP layer checksums and compare with reference
-                for name, tensor in layer_outputs_cp.items():
-                    local_checksum = tensor.float().sum()
-                    # Gather checksums from all ranks
-                    all_checksums = [
-                        torch.zeros_like(local_checksum) for _ in range(world_size)
-                    ]
-                    dist.all_gather(all_checksums, local_checksum)
-                    total_checksum = sum(c.item() for c in all_checksums)
-                    ref_checksum = (
-                        layer_outputs_ref[name].float().sum().item()
-                        if name in layer_outputs_ref
-                        else 0
-                    )
-                    diff = abs(total_checksum - ref_checksum)
-                    print(
-                        f"[CP-SANITY][rank={rank}] CP {name}: local_shape={tuple(tensor.shape)} total_checksum={total_checksum:.4f} ref={ref_checksum:.4f} diff={diff:.4f}"
-                    )
-                print(
-                    f"[CP-SANITY][rank={rank}] Model returned, logits shape={tuple(cp_logits.shape)}"
-                )
-
-                # Gather sums from all ranks
-                all_sums = [torch.zeros_like(local_sum) for _ in range(world_size)]
-                dist.all_gather(all_sums, local_sum)
-                cp_total_sum = sum(s.item() for s in all_sums)
-
-                print(
-                    f"[CP-SANITY][rank={rank}] CP local logits_sum={local_sum.item():.4f}"
-                )
-                print(
-                    f"[CP-SANITY][rank={rank}] CP total logits_sum={cp_total_sum:.4f} (ref={ref_sum:.4f})"
-                )
-
-                # Check if they match
-                diff = abs(cp_total_sum - ref_sum)
-                if diff < 0.01:
-                    print(
-                        f"[CP-SANITY][rank={rank}] ✓ PASS: Outputs match (diff={diff:.6f})"
-                    )
-                else:
-                    print(
-                        f"[CP-SANITY][rank={rank}] ✗ FAIL: Outputs differ (diff={diff:.6f})"
-                    )
-                    print(
-                        f"[CP-SANITY][rank={rank}] This indicates ring attention may not be working correctly"
-                    )
-
-    # Restore Flash Attention flag
-    llama_module.HAS_FLASH_ATTENTION = original_has_flash
-
-    model.train()
-    dist.barrier()
 
 
 def _torch_version() -> Version:
@@ -850,32 +554,6 @@ class ContextParallelManager:
         shift_labels = padded[:, 1:].contiguous()
         inputs["shift_labels"] = shift_labels
 
-    def _debug_validate_buffers(
-        self,
-        buffers: list[torch.Tensor],
-    ) -> None:
-        if not buffers or self._cp_group is None:
-            return
-        summaries: list[tuple] = []
-        for tensor in buffers:
-            if not torch.is_tensor(tensor):
-                continue
-            cpu_tensor = tensor.detach().to("cpu").contiguous()
-            checksum = hashlib.sha256(cpu_tensor.numpy().tobytes()).hexdigest()
-            shape = tuple(cpu_tensor.shape)
-            dtype = str(cpu_tensor.dtype)
-            summaries.append((shape, dtype, checksum))
-        if not summaries:
-            return
-        gathered: list[list[tuple]] = [None] * self.settings.size  # type: ignore[list-item]
-        dist.all_gather_object(gathered, summaries, group = self._cp_group)
-        reference = gathered[0]
-        for idx, summary in enumerate(gathered[1:], start = 1):
-            if summary != reference:
-                raise RuntimeError(
-                    f"Context parallel buffers differ across ranks before sharding (rank {idx} mismatch)."
-                )
-
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
         token = None
@@ -889,11 +567,9 @@ class ContextParallelManager:
             self._ensure_position_ids(inputs)
             self._ensure_shift_labels(inputs)
             buffers, seq_dims, no_restore = self._collect_buffers(inputs)
-            self._debug_validate_buffers(buffers)
             if not buffers:
                 yield
                 return
-            # Debug: verify load balance setting at runtime
             # If SDPA is already patched (via enter_sdpa_patch), do buffer sharding only
             # to avoid context_parallel's __exit__ from unpatching SDPA before backward
             sdpa_already_patched = getattr(self, "_sdpa_patch_active", False)
@@ -1395,21 +1071,8 @@ def _patch_sft_trainer(trl_module) -> None:
                     # Note: This is an approximation assuming uniform batch sizes
                     manager._cached_num_items = local_count.item() * ga_steps
 
-            # Debug: verify num_items_in_batch and dataset items
             kwargs.pop("num_items_in_batch", None)
             inputs.pop("num_items_in_batch", None)
-        # One-time sanity check to verify model outputs match between CP and non-CP
-        if (
-            manager
-            and manager.enabled
-            and os.environ.get("UNSLOTH_CP_SANITY_CHECK") == "1"
-            and not getattr(manager, "_sanity_check_done", False)
-        ):
-            manager._sanity_check_done = True
-            try:
-                _run_cp_sanity_check(model, manager)
-            except Exception as e:
-                print(f"[CP-SANITY] Error running sanity check: {e}")
 
         context = manager.apply(inputs) if manager else contextlib.nullcontext()
         with context:
@@ -1420,7 +1083,6 @@ def _patch_sft_trainer(trl_module) -> None:
             rank = 0
             if dist.is_initialized():
                 rank = dist.get_rank()
-            # Enhanced CP Loss Debug
             # For context parallelism with shift_labels, prefer letting the model
             # handle the pre-shifted targets when it advertises support. Otherwise
             # fall back to an external loss that consumes the sharded tensors.
@@ -1436,7 +1098,6 @@ def _patch_sft_trainer(trl_module) -> None:
                 )
             )
 
-            # Debug: trace the compute_loss path
             if use_cp_shift_labels and not model_supports_shift_labels:
                 # Remove labels so model doesn't compute loss internally
                 saved_labels = inputs.pop("labels", None)
