@@ -946,6 +946,14 @@ class ContextParallelManager:
             if num_items is None or num_items <= 0:
                 num_items = global_tokens.item()  # fallback to per-batch tokens
 
+            if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
+                print(
+                    f"[CP-REDUCE-DEBUG][rank={self._cp_rank_index}] "
+                    f"local_loss={tensor.item():.6f} local_tokens={local_tokens.item():.0f} "
+                    f"global_tokens={global_tokens.item():.0f} cached_num_items={self._cached_num_items} "
+                    f"num_items={num_items}"
+                )
+
             # Each rank backwards on: local_loss * (local_tokens / num_items_in_batch)
             weight_fraction_for_backward = local_tokens.detach() / num_items
             weighted_loss = tensor * weight_fraction_for_backward
