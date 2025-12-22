@@ -903,76 +903,76 @@ class ContextParallelManager:
                 f"labels_valid={l_count} labels_shape={l_shape}"
             )
 
-        def _reduce_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def _reduce_tensor(
+            tensor: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             if tensor is None or not torch.is_tensor(tensor):
                 zeros = torch.zeros(
                     (),
                     dtype = tensor.dtype if torch.is_tensor(tensor) else torch.float32,
                     device = tensor.device if torch.is_tensor(tensor) else None,
                 )
-                return tensor, zeros
+                return tensor, zeros, zeros
 
             # Count valid tokens from sharded shift_labels (stays sharded due to no_restore)
-            # This gives us the correct local token count for weighted averaging
             shift_labels = inputs.get("shift_labels")
             if isinstance(shift_labels, torch.Tensor):
-                # Count non-ignored tokens (-100 is ignore_index)
-                local_weight = (
+                local_tokens = (
                     shift_labels.ne(-100)
                     .sum()
                     .to(device = tensor.device, dtype = tensor.dtype)
                 )
             else:
-                # Fallback: use sharded labels if available
                 labels = inputs.get("labels")
                 if isinstance(labels, torch.Tensor):
-                    local_weight = (
+                    local_tokens = (
                         labels.ne(-100)
                         .sum()
                         .to(device = tensor.device, dtype = tensor.dtype)
                     )
                 else:
-                    # Last resort: assume equal distribution
-                    local_weight = torch.tensor(
+                    local_tokens = torch.tensor(
                         1.0, dtype = tensor.dtype, device = tensor.device
                     )
+
+            # Get global token count WITHOUT gradients - just for normalization
+            global_tokens = local_tokens.detach().clone()
+            dist.all_reduce(global_tokens, op = dist.ReduceOp.SUM, group = self._cp_group)
+
+            # Scale local loss by its weight contribution.
+            # Each rank backwards on: local_loss * (local_tokens / global_tokens)
+            # This ensures gradients are correctly weighted.
+            weight_fraction = local_tokens.detach() / global_tokens
+            weighted_loss = tensor * weight_fraction
+
+            # All-reduce to get the global weighted mean for reporting
+            # Use a detached copy so all_reduce doesn't affect gradient flow
+            global_loss_for_report = weighted_loss.detach().clone()
+            dist.all_reduce(
+                global_loss_for_report, op = dist.ReduceOp.SUM, group = self._cp_group
+            )
 
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] _reduce_tensor: "
-                    f"raw_loss={tensor.item()} local_weight={local_weight.item()} "
-                    f"cp-rank={self._cp_rank_index}"
+                    f"local_loss={tensor.item()} local_tokens={local_tokens.item()} "
+                    f"global_tokens={global_tokens.item()} weighted_loss={weighted_loss.item()} "
+                    f"global_loss={global_loss_for_report.item()} cp-rank={self._cp_rank_index}"
                 )
 
-            # Convert mean to sum: sum = mean * count
-            scaled = tensor * local_weight
-            # All-reduce to get global sum and global count
-            dist.all_reduce(scaled, op = dist.ReduceOp.SUM, group = self._cp_group)
-            dist.all_reduce(local_weight, op = dist.ReduceOp.SUM, group = self._cp_group)
+            # Return weighted_loss (for backward) and global_loss (for reporting)
+            return weighted_loss, global_loss_for_report, global_tokens
 
+        def _finalize(weighted_loss, global_loss, global_tokens):
+            # weighted_loss: used for backward (gradients flow correctly per-rank)
+            # global_loss: used for reporting (same value on all ranks)
+            self._set_report_loss(global_loss)
+            self._set_report_tokens(global_tokens)
             if _cp_debug_enabled():
                 _cp_debug(
-                    f"[CP-DEBUG][focus] _reduce_tensor after all_reduce: "
-                    f"global_sum={scaled.item()} global_weight={local_weight.item()} "
+                    f"[CP-DEBUG][focus] reduce_loss _finalize: weighted_loss={weighted_loss.item()} "
+                    f"global_loss={global_loss.item()} global_tokens={global_tokens.item()} "
                     f"cp-rank={self._cp_rank_index}"
-                )
-
-            return scaled, local_weight
-
-        def _finalize(summed, tokens):
-            eps = torch.finfo(summed.dtype).eps
-            # Use per-batch token count for normalization to match how the model
-            # computes loss without num_items_in_batch (mean reduction).
-            # This produces the same loss as CP=1 for each micro-batch.
-            denominator = tokens
-            normalized = summed / torch.clamp(denominator, min = eps)
-            self._set_report_loss(normalized)
-            self._set_report_tokens(tokens)
-            if _cp_debug_enabled():
-                _cp_debug(
-                    f"[CP-DEBUG][focus] reduce_loss _finalize: summed={summed.item()} tokens={tokens.item()} "
-                    f"cached_num_items={self._cached_num_items} denominator={denominator.item()} "
-                    f"normalized={normalized.item()} cp-rank={self._cp_rank_index}"
                 )
             # Enhanced CP Loss Debug
             if (
@@ -981,21 +981,21 @@ class ContextParallelManager:
             ):
                 print(
                     f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss: "
-                    f"global_sum={summed.item():.6f} global_tokens={tokens.item():.1f} "
-                    f"cached_num_items={self._cached_num_items} "
-                    f"denominator={denominator.item():.1f} normalized_loss={normalized.item():.6f}"
+                    f"weighted_loss={weighted_loss.item():.6f} global_loss={global_loss.item():.6f} "
+                    f"global_tokens={global_tokens.item():.1f}"
                 )
-            return normalized
+            # Return weighted_loss for backward - gradients will be correctly scaled
+            return weighted_loss
 
         if isinstance(loss, tuple):
             if not loss:
                 return loss
-            summed, tokens = _reduce_tensor(loss[0])
-            normalized = _finalize(summed, tokens)
-            return (normalized, *loss[1:])
+            weighted_loss, global_loss, global_tokens = _reduce_tensor(loss[0])
+            result = _finalize(weighted_loss, global_loss, global_tokens)
+            return (result, *loss[1:])
         elif torch.is_tensor(loss):
-            summed, tokens = _reduce_tensor(loss)
-            return _finalize(summed, tokens)
+            weighted_loss, global_loss, global_tokens = _reduce_tensor(loss)
+            return _finalize(weighted_loss, global_loss, global_tokens)
         return loss
 
 
