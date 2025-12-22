@@ -26,6 +26,11 @@ try:
         env_lb = os.environ.get("UNSLOTH_CP_LB")
         if env_lb is not None:
             _cp_options.enable_load_balance = env_lb not in ("0", "false", "False")
+        # Debug: print actual LB setting
+        if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+            print(
+                f"[CP-LB-DEBUG][INIT] UNSLOTH_CP_LB={env_lb} enable_load_balance={_cp_options.enable_load_balance}"
+            )
     except Exception:
         pass
 
@@ -733,6 +738,19 @@ class ContextParallelManager:
             if not buffers:
                 yield
                 return
+            # Debug: verify load balance setting at runtime
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                try:
+                    from torch.distributed.tensor.experimental._attention import (
+                        _cp_options,
+                    )
+
+                    print(
+                        f"[CP-LB-DEBUG][RUNTIME][rank={self._cp_rank_index}] enable_load_balance={_cp_options.enable_load_balance}"
+                    )
+                except Exception:
+                    pass
+
             with context_parallel(
                 self._mesh,
                 buffers = buffers,
