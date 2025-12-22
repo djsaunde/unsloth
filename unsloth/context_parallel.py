@@ -816,7 +816,8 @@ class ContextParallelManager:
         return None
 
     def _adjust_num_items_in_batch(self, inputs: dict[str, torch.Tensor]) -> None:
-        # Remove num_items_in_batch so the model computes loss using LOCAL token count.
+        # Cache and remove num_items_in_batch so the model computes loss using LOCAL token count.
+        # We'll use the cached value in reduce_loss for proper gradient accumulation support.
         #
         # With context parallelism, each rank has a shard of the sequence. If we pass
         # the GLOBAL num_items_in_batch, the model computes: loss = local_sum / global_count
@@ -825,11 +826,12 @@ class ContextParallelManager:
         #
         # By removing num_items_in_batch, the model computes: loss = local_sum / local_count
         # Then reduce_loss correctly recovers: scaled = loss * local_count = local_sum
-        # And the final reduction: global_sum / global_count gives the correct result.
+        # The final reduction uses the CACHED num_items_in_batch (total across GA steps)
+        # for proper gradient accumulation: global_sum / num_items_in_batch
         self._cached_num_items = None
         if not self.enabled or "num_items_in_batch" not in inputs:
             return
-        # Cache the global value for debugging, then remove from inputs
+        # Cache the global value for use in reduce_loss
         value = inputs.get("num_items_in_batch")
         if value is not None:
             self._cached_num_items = value.item() if torch.is_tensor(value) else value
@@ -957,12 +959,23 @@ class ContextParallelManager:
 
         def _finalize(summed, tokens):
             eps = torch.finfo(summed.dtype).eps
-            normalized = summed / torch.clamp(tokens, min = eps)
+            # If num_items_in_batch was cached (from gradient accumulation), use it
+            # instead of the computed global tokens. This ensures correct loss scaling
+            # when gradient_accumulation_steps > 1.
+            denominator = tokens
+            if self._cached_num_items is not None and self._cached_num_items > 0:
+                denominator = torch.tensor(
+                    self._cached_num_items,
+                    dtype = summed.dtype,
+                    device = summed.device,
+                )
+            normalized = summed / torch.clamp(denominator, min = eps)
             self._set_report_loss(normalized)
             self._set_report_tokens(tokens)
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] reduce_loss _finalize: summed={summed.item()} tokens={tokens.item()} "
+                    f"cached_num_items={self._cached_num_items} denominator={denominator.item()} "
                     f"normalized={normalized.item()} cp-rank={self._cp_rank_index}"
                 )
             # Enhanced CP Loss Debug
@@ -970,6 +983,7 @@ class ContextParallelManager:
                 print(
                     f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss FINAL: "
                     f"global_sum={summed.item():.6f} global_tokens={tokens.item():.1f} "
+                    f"cached_num_items={self._cached_num_items} "
                     f"normalized_loss={normalized.item():.6f}"
                 )
             return normalized
@@ -1369,17 +1383,6 @@ def _patch_sft_trainer(trl_module) -> None:
             _cp_debug(f"[CP-DEBUG][rank={rank}] raw loss={loss}")
         if manager:
             loss = manager.reduce_loss(loss, inputs)
-            # With CP, we remove num_items_in_batch, causing training_step to divide
-            # loss by gradient_accumulation_steps. Pre-multiply to counter this,
-            # ensuring correct loss scaling with gradient accumulation.
-            ga_steps = getattr(
-                getattr(self, "args", None), "gradient_accumulation_steps", 1
-            )
-            if ga_steps > 1:
-                if isinstance(loss, tuple):
-                    loss = (loss[0] * ga_steps,) + loss[1:]
-                elif torch.is_tensor(loss):
-                    loss = loss * ga_steps
         if _cp_debug_enabled():
             _cp_debug(f"[CP-DEBUG][rank={rank}] reduced loss={loss}")
         return loss
