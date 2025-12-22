@@ -1248,14 +1248,45 @@ def _patch_sft_trainer(trl_module) -> None:
                 getattr(self, "args", None), "gradient_accumulation_steps", 1
             )
             # Cache num_items_in_batch before removing
-            if "num_items_in_batch" in kwargs:
-                value = kwargs.get("num_items_in_batch")
-                if value is not None:
-                    manager._cached_num_items = (
-                        value.item() if torch.is_tensor(value) else value
-                    )
+            num_items_val = kwargs.get("num_items_in_batch")
+            if num_items_val is not None:
+                manager._cached_num_items = (
+                    num_items_val.item()
+                    if torch.is_tensor(num_items_val)
+                    else num_items_val
+                )
+
+            # Debug: verify num_items_in_batch and dataset items
+            if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                input_ids = inputs.get("input_ids")
+                # Get first few tokens as identifier (before sharding)
+                id_preview = None
+                if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0:
+                    id_preview = input_ids.flatten()[:8].tolist()
+                print(
+                    f"[CP-GA-DEBUG][rank={rank}] num_items_in_batch={num_items_val} "
+                    f"cached={manager._cached_num_items} ga_steps={manager._cached_ga_steps} "
+                    f"input_ids_preview={id_preview}"
+                )
+
             kwargs.pop("num_items_in_batch", None)
             inputs.pop("num_items_in_batch", None)
+        elif os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
+            # Debug for CP=1 case (no manager or not enabled)
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            num_items_val = kwargs.get("num_items_in_batch")
+            input_ids = inputs.get("input_ids")
+            id_preview = None
+            if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0:
+                id_preview = input_ids.flatten()[:8].tolist()
+            ga_steps = getattr(
+                getattr(self, "args", None), "gradient_accumulation_steps", 1
+            )
+            print(
+                f"[CP-GA-DEBUG][rank={rank}][CP=1] num_items_in_batch={num_items_val} "
+                f"ga_steps={ga_steps} input_ids_preview={id_preview}"
+            )
 
         # One-time sanity check to verify model outputs match between CP and non-CP
         if (
