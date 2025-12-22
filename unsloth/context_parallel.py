@@ -602,11 +602,19 @@ class ContextParallelManager:
         This is needed to keep SDPA patched during backward pass with
         gradient checkpointing, which re-runs forward outside the normal
         context_parallel context manager.
+
+        Also initializes deferred buffer restoration - buffers sharded in
+        apply() will be restored in exit_sdpa_patch() instead of immediately,
+        ensuring buffers stay sharded during backward pass.
         """
         if not self.enabled or self._mesh is None:
             return
         if getattr(self, "_sdpa_patch_active", False):
             return  # Already patched
+
+        # Initialize deferred buffer restoration list
+        # This will be populated by apply() and processed in exit_sdpa_patch()
+        self._pending_buffer_restores: list[tuple[torch.Tensor, torch.Tensor]] = []
 
         try:
             from torch.distributed.tensor.experimental._attention import (
@@ -670,7 +678,12 @@ class ContextParallelManager:
                 )
 
     def exit_sdpa_patch(self) -> None:
-        """Exit SDPA patching that was entered with enter_sdpa_patch()."""
+        """Exit SDPA patching that was entered with enter_sdpa_patch().
+
+        Also restores any buffers that were deferred during apply().
+        This ensures buffers stay sharded throughout both forward and backward
+        passes when gradient checkpointing is enabled.
+        """
         if not getattr(self, "_sdpa_patch_active", False):
             return
 
@@ -678,6 +691,19 @@ class ContextParallelManager:
             from torch.distributed.tensor.experimental._attention import (
                 _restore_function,
             )
+
+            # Restore deferred buffers FIRST, before exiting CP context
+            # This ensures backward pass (with gradient checkpointing) sees sharded buffers
+            pending = getattr(self, "_pending_buffer_restores", [])
+            if pending:
+                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                    print(
+                        f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Restoring {len(pending)} deferred buffers"
+                    )
+                for buffer, original in pending:
+                    buffer.resize_(original.shape)
+                    buffer.copy_(original)
+                self._pending_buffer_restores = []
 
             # Exit CP dispatcher
             if (
@@ -996,26 +1022,18 @@ class ContextParallelManager:
 
                     yield
 
-                    # Restore buffers that need restoration
-                    from torch.distributed.tensor.experimental._attention import (
-                        _cp_options,
-                        _RoundRobinLoadBalancer,
-                        _SequentialSharder,
-                    )
-
-                    sharder = (
-                        _RoundRobinLoadBalancer
-                        if _cp_options.enable_load_balance
-                        else _SequentialSharder
-                    )
-                    for buffer, orig, seq_dim in zip(
-                        buffers, original_buffers, seq_dims
-                    ):
+                    # Defer buffer restoration to exit_sdpa_patch()
+                    # This ensures buffers stay sharded during backward pass
+                    # (critical for gradient checkpointing which re-runs forward)
+                    for buffer, orig in zip(buffers, original_buffers):
                         if orig is not None:
-                            # Need to unshard
-                            unsharded = sharder.unshard(buffer, self._mesh, seq_dim)
-                            buffer.resize_(orig.shape)
-                            buffer.copy_(orig)
+                            self._pending_buffer_restores.append((buffer, orig))
+
+                    if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                        print(
+                            f"[CP-LB-DEBUG][rank={self._cp_rank_index}] Deferred {len([o for o in original_buffers if o is not None])} buffer restorations"
+                        )
+
                 except ImportError:
                     # Fallback to context_parallel if imports fail
                     with context_parallel(
