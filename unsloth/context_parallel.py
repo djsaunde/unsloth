@@ -490,23 +490,50 @@ def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
         List of hook handles that can be used to remove the hooks later
     """
     handles = []
+    debug = os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1"
+
+    _hook_call_count = [0]  # Use list to allow mutation in closure
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
         # Remove attention_mask and set is_causal=True
         # This ensures ring attention uses causal masking correctly
+        had_mask = (
+            "attention_mask" in module_kwargs
+            and module_kwargs["attention_mask"] is not None
+        )
         if "attention_mask" in module_kwargs:
             module_kwargs["attention_mask"] = None
         if "is_causal" in module_kwargs or hasattr(_module, "is_causal"):
             module_kwargs["is_causal"] = True
+
+        # Debug: log first few hook calls
+        if debug and _hook_call_count[0] < 3:
+            _hook_call_count[0] += 1
+            rank = int(os.environ.get("RANK", "0"))
+            print(
+                f"[CP-HOOK-DEBUG][rank={rank}] Hook called! had_mask={had_mask} kwargs_keys={list(module_kwargs.keys())}"
+            )
+
         return module_args, module_kwargs
 
+    # Find all self_attn modules - they may be nested in PEFT wrappers
+    attn_modules = []
     for name, module in model.named_modules():
         # Attach to modules ending with self_attn (transformers convention)
         if name.endswith("self_attn"):
-            handle = module.register_forward_pre_hook(
-                _self_attn_pre_forward_hook, with_kwargs = True, prepend = True
-            )
-            handles.append(handle)
+            attn_modules.append((name, module))
+
+    if debug and int(os.environ.get("RANK", "0")) == 0:
+        print(f"[CP-HOOK-DEBUG] Model type: {type(model).__name__}")
+        print(f"[CP-HOOK-DEBUG] Found {len(attn_modules)} self_attn modules")
+        if attn_modules:
+            print(f"[CP-HOOK-DEBUG] First module: {attn_modules[0][0]}")
+
+    for name, module in attn_modules:
+        handle = module.register_forward_pre_hook(
+            _self_attn_pre_forward_hook, with_kwargs = True, prepend = True
+        )
+        handles.append(handle)
 
     if handles and int(os.environ.get("RANK", "0")) == 0:
         print(
@@ -1335,6 +1362,10 @@ def _patch_sft_trainer(trl_module) -> None:
             model = getattr(self, "model", None)
             if model is not None:
                 manager.attach_attention_hooks(model)
+            elif int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    "Context parallelism: WARNING - model not available at init time for hook attachment"
+                )
 
     def _maybe_enable_ddp_static_graph(trainer):
         ddp_model = getattr(trainer, "model_wrapped", None)
@@ -1693,6 +1724,11 @@ def _patch_sft_trainer(trl_module) -> None:
         if manager:
             setattr(self.args, "_n_gpu", manager.data_parallel_world_size)
             _maybe_enable_sync_each_batch(self)
+            # Attach attention hooks if not already done (model may not be ready at init)
+            if manager.enabled and not manager._attention_hook_handles:
+                model = getattr(self, "model", None)
+                if model is not None:
+                    manager.attach_attention_hooks(model)
             # Note: static_graph is disabled because it causes internal PyTorch
             # assertion errors with unsloth's gradient checkpointing.
             # sync_each_batch keeps the graph constant instead.
