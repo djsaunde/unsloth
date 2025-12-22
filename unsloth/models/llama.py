@@ -2308,6 +2308,19 @@ def CausalLM_fast_forward(fast_forward_inference):
                 effective_labels = (
                     _get_shift_labels() if has_pre_shift_labels else labels
                 )
+                # Load balancing debug: log effective_labels before fused loss
+                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                    import torch.distributed as _dist_lb2
+
+                    _rank_lb2 = (
+                        _dist_lb2.get_rank() if _dist_lb2.is_initialized() else 0
+                    )
+                    if torch.is_tensor(effective_labels):
+                        eff_flat = effective_labels.flatten().tolist()
+                        valid_count = (effective_labels != -100).sum().item()
+                        print(
+                            f"[CP-LB-DEBUG][FUSED-LOSS][rank={_rank_lb2}] effective_labels[:15]={eff_flat[:15]} valid={valid_count} shift_labels={not has_pre_shift_labels}"
+                        )
                 loss = unsloth_fused_ce_loss(
                     trainer = None,
                     hidden_states = hidden_states,
@@ -2322,6 +2335,18 @@ def CausalLM_fast_forward(fast_forward_inference):
                     logit_softcapping = logit_softcapping,
                     shift_labels = not has_pre_shift_labels,
                 )
+                # Load balancing debug: log loss after fused computation
+                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1" and torch.is_tensor(
+                    loss
+                ):
+                    import torch.distributed as _dist_lb3
+
+                    _rank_lb3 = (
+                        _dist_lb3.get_rank() if _dist_lb3.is_initialized() else 0
+                    )
+                    print(
+                        f"[CP-LB-DEBUG][FUSED-LOSS][rank={_rank_lb3}] loss={loss.detach().float().item():.6f}"
+                    )
                 if _cp_debug_enabled() and torch.is_tensor(loss):
                     _cp_debug(
                         f"[CP-DEBUG][loss] value={loss.detach().float().item():.6f}"
