@@ -1604,6 +1604,20 @@ def _patch_sft_trainer(trl_module) -> None:
                 outputs = model(**inputs)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
+                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                    print(
+                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] logits shape={tuple(logits.shape)} shift_labels shape={tuple(local_shift_labels.shape)}"
+                    )
+                    # Check first few logits argmax vs labels
+                    argmax_preds = logits[0, :5].argmax(dim = -1).tolist()
+                    labels_preview = local_shift_labels[0, :5].tolist()
+                    print(
+                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] First 5 predictions (argmax): {argmax_preds}"
+                    )
+                    print(
+                        f"[CP-LB-DEBUG][COMPUTE-LOSS][rank={rank}] First 5 labels: {labels_preview}"
+                    )
+
                 # Compute loss using pre-shifted labels
                 # No additional shifting needed - shift_labels already contains
                 # the correct "next token" for each position after sharding

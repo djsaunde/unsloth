@@ -1163,6 +1163,18 @@ def LlamaAttention_fast_forward(
             "[CP-DEBUG][attn] Context parallel requested but non-SDPA path selected; forcing SDPA."
         )
 
+    # Debug: trace attention path
+    if (
+        os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1"
+        and getattr(self, "layer_idx", 0) == 0
+    ):
+        import torch.distributed as _dist
+
+        _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        print(
+            f"[CP-ATTN-PATH][rank={_rank}] cp_active={cp_active} use_xformers={use_xformers} use_flash={use_flash} SDPA_HAS_GQA={SDPA_HAS_GQA}"
+        )
+
     if use_xformers:
         # Xformers memory efficient attention
         # Also has Flash Attention v2 dispatching
@@ -1261,6 +1273,14 @@ def LlamaAttention_fast_forward(
             if _sdpa_debug or _sanity_check_layer0:
                 print(
                     f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] Calling SDPA fn: {_sdpa_fn.__name__} from {_sdpa_fn.__module__}"
+                )
+            # Debug: check if SDPA is patched for context parallel
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1" and _layer_idx == 0:
+                is_patched = hasattr(_sdpa_fn, "__wrapped__") or "wrapper" in str(
+                    type(_sdpa_fn)
+                )
+                print(
+                    f"[CP-SDPA-DEBUG][rank={_rank}] SDPA function: {_sdpa_fn} is_patched={is_patched} id={id(_sdpa_fn)}"
                 )
                 if hasattr(_sdpa_fn, "__closure__") and _sdpa_fn.__closure__:
                     print(
