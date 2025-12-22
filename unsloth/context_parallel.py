@@ -961,20 +961,10 @@ class ContextParallelManager:
 
         def _finalize(summed, tokens):
             eps = torch.finfo(summed.dtype).eps
-            # If num_items_in_batch was cached (from gradient accumulation), use it
-            # instead of the computed global tokens. This ensures correct loss scaling
-            # when gradient_accumulation_steps > 1.
-            #
-            # Note: We do NOT multiply by GA here. HF Trainer's training_step already
-            # handles the GA multiplication when num_items_in_batch is present (which
-            # it is - we only pop from kwargs/inputs, not from training_step's parameter).
+            # Use per-batch token count for normalization to match how the model
+            # computes loss without num_items_in_batch (mean reduction).
+            # This produces the same loss as CP=1 for each micro-batch.
             denominator = tokens
-            if self._cached_num_items is not None and self._cached_num_items > 0:
-                denominator = torch.tensor(
-                    self._cached_num_items,
-                    dtype = summed.dtype,
-                    device = summed.device,
-                )
             normalized = summed / torch.clamp(denominator, min = eps)
             self._set_report_loss(normalized)
             self._set_report_tokens(tokens)
