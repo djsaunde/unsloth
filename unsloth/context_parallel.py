@@ -950,10 +950,9 @@ class ContextParallelManager:
             weight_fraction_for_backward = local_tokens.detach() / num_items
             weighted_loss = tensor * weight_fraction_for_backward
 
-            # For reporting: compute global mean (sum(CE) / global_tokens)
-            weight_fraction_for_report = local_tokens.detach() / global_tokens
-            local_contribution = tensor.detach() * weight_fraction_for_report
-            global_loss_for_report = local_contribution.clone()
+            # For reporting: sum of weighted_loss across ranks = total_CE / num_items
+            # This matches CP=1's per-batch loss (each normalized by total GA tokens)
+            global_loss_for_report = weighted_loss.detach().clone()
             dist.all_reduce(
                 global_loss_for_report, op = dist.ReduceOp.SUM, group = self._cp_group
             )
@@ -1602,21 +1601,15 @@ def _patch_sft_trainer(trl_module) -> None:
 
     @functools.wraps(original_log)
     def patched_log(self, logs, start_time = None):
+        # Don't override the loss - let the Trainer accumulate losses correctly.
+        # The per-batch losses returned from training_step are now correct
+        # (normalized by total GA tokens), so the Trainer's accumulation will
+        # produce the same result as CP=1.
         manager = getattr(self, "_context_parallel_manager", None)
-        if (
-            manager
-            and logs is not None
-            and "loss" in logs
-            and hasattr(self, "_context_parallel_last_loss")
-        ):
-            logs = dict(logs)
-            tokens = getattr(self, "_context_parallel_last_tokens", None)
-            if tokens is not None and tokens > 0:
-                logs["loss"] = self._context_parallel_last_loss
-                delattr(self, "_context_parallel_last_tokens")
-            else:
-                logs["loss"] = self._context_parallel_last_loss
+        if manager and hasattr(self, "_context_parallel_last_loss"):
             delattr(self, "_context_parallel_last_loss")
+        if manager and hasattr(self, "_context_parallel_last_tokens"):
+            delattr(self, "_context_parallel_last_tokens")
         return original_log(self, logs, start_time)
 
     def enable_context_parallel(self, **kwargs):
