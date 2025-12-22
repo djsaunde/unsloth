@@ -965,30 +965,24 @@ class ContextParallelManager:
             # instead of the computed global tokens. This ensures correct loss scaling
             # when gradient_accumulation_steps > 1.
             #
-            # When num_items_in_batch is present, HF Trainer multiplies loss by GA before
-            # backward to counter accelerate's internal division. Since we removed
-            # num_items_in_batch from inputs, training_step will instead divide by GA.
-            # We pre-multiply by GA here to counter that division.
+            # Note: We do NOT multiply by GA here. HF Trainer's training_step already
+            # handles the GA multiplication when num_items_in_batch is present (which
+            # it is - we only pop from kwargs/inputs, not from training_step's parameter).
             denominator = tokens
-            ga_multiplier = 1
             if self._cached_num_items is not None and self._cached_num_items > 0:
                 denominator = torch.tensor(
                     self._cached_num_items,
                     dtype = summed.dtype,
                     device = summed.device,
                 )
-                # Get GA steps to counter the division in training_step
-                ga_multiplier = getattr(self, "_cached_ga_steps", 1)
             normalized = summed / torch.clamp(denominator, min = eps)
-            if ga_multiplier > 1:
-                normalized = normalized * ga_multiplier
             self._set_report_loss(normalized)
             self._set_report_tokens(tokens)
             if _cp_debug_enabled():
                 _cp_debug(
                     f"[CP-DEBUG][focus] reduce_loss _finalize: summed={summed.item()} tokens={tokens.item()} "
                     f"cached_num_items={self._cached_num_items} denominator={denominator.item()} "
-                    f"ga_multiplier={ga_multiplier} normalized={normalized.item()} cp-rank={self._cp_rank_index}"
+                    f"normalized={normalized.item()} cp-rank={self._cp_rank_index}"
                 )
             # Enhanced CP Loss Debug
             if (
@@ -998,7 +992,7 @@ class ContextParallelManager:
                 print(
                     f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss: "
                     f"global_sum={summed.item():.6f} global_tokens={tokens.item():.1f} "
-                    f"cached_num_items={self._cached_num_items} ga_multiplier={ga_multiplier} "
+                    f"cached_num_items={self._cached_num_items} "
                     f"denominator={denominator.item():.1f} normalized_loss={normalized.item():.6f}"
                 )
             return normalized

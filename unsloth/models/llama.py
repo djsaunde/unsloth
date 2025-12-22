@@ -2472,13 +2472,15 @@ def PeftModel_fast_forward(
             **kwargs,
         )
     else:
+        # Only pass shift_labels if set (for context parallelism)
+        if shift_labels is not None:
+            kwargs["shift_labels"] = shift_labels
         return self.base_model(
             input_ids = input_ids,
             causal_mask = causal_mask,
             attention_mask = attention_mask,
             inputs_embeds = inputs_embeds,
             labels = labels,
-            shift_labels = shift_labels,
             output_attentions = output_attentions,
             output_hidden_states = output_hidden_states,
             return_dict = return_dict,
