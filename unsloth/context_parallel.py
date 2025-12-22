@@ -1207,6 +1207,28 @@ class ContextParallelManager:
         if not self.enabled or self.settings.size <= 1 or self._cp_group is None:
             return loss
 
+        # Simple loss mode: match accelerate's approach exactly
+        # Just use raw loss for backward, AVG all_reduce for reporting
+        if os.environ.get("UNSLOTH_CP_SIMPLE_LOSS") == "1":
+            if torch.is_tensor(loss):
+                # Clone for reporting (don't modify original gradient graph)
+                report_loss = loss.detach().clone()
+                dist.all_reduce(report_loss, op = dist.ReduceOp.AVG, group = self._cp_group)
+                self._set_report_loss(report_loss)
+                if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
+                    print(
+                        f"[CP-SIMPLE-LOSS][rank={self._cp_rank_index}] "
+                        f"local_loss={loss.item():.6f} avg_loss={report_loss.item():.6f}"
+                    )
+                # Return raw loss for backward (like accelerate)
+                return loss
+            elif isinstance(loss, tuple) and loss and torch.is_tensor(loss[0]):
+                report_loss = loss[0].detach().clone()
+                dist.all_reduce(report_loss, op = dist.ReduceOp.AVG, group = self._cp_group)
+                self._set_report_loss(report_loss)
+                return loss
+            return loss
+
         # Debug: Check if labels exist in inputs after context manager
         if _cp_debug_enabled():
             labels_in = inputs.get("labels")

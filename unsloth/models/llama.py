@@ -1286,6 +1286,29 @@ def LlamaAttention_fast_forward(
                     print(
                         f"[CP-SDPA-DEBUG][rank={_rank}][layer={_layer_idx}] SDPA fn has closure with {len(_sdpa_fn.__closure__)} cells"
                     )
+            # Debug: Check SDPA backend being used (ring attention only works with flash/efficient)
+            if os.environ.get("UNSLOTH_CP_DEBUG_BACKEND") == "1" and _layer_idx == 0:
+                try:
+                    ctx = torch.backends.cuda.sdp_kernel(
+                        enable_flash = True, enable_math = True, enable_mem_efficient = True
+                    )
+                    with ctx:
+                        # Check which backend would be used
+                        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                        # This will show what backend is available
+                        print(f"[CP-BACKEND][rank={_rank}] Checking SDPA backends...")
+                        print(
+                            f"[CP-BACKEND][rank={_rank}] Flash available: {torch.backends.cuda.flash_sdp_enabled()}"
+                        )
+                        print(
+                            f"[CP-BACKEND][rank={_rank}] Mem efficient available: {torch.backends.cuda.mem_efficient_sdp_enabled()}"
+                        )
+                        print(
+                            f"[CP-BACKEND][rank={_rank}] Math available: {torch.backends.cuda.math_sdp_enabled()}"
+                        )
+                except Exception as e:
+                    print(f"[CP-BACKEND][rank={_rank}] Backend check error: {e}")
             A = _sdpa_fn(
                 Q,
                 K,
