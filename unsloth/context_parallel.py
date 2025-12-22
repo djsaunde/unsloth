@@ -991,12 +991,15 @@ class ContextParallelManager:
                     f"ga_multiplier={ga_multiplier} normalized={normalized.item()} cp-rank={self._cp_rank_index}"
                 )
             # Enhanced CP Loss Debug
-            if os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1":
+            if (
+                os.environ.get("UNSLOTH_CP_DEBUG_LOSS") == "1"
+                or os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1"
+            ):
                 print(
-                    f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss FINAL: "
+                    f"[CP-LOSS-DEBUG][rank={self._cp_rank_index}] reduce_loss: "
                     f"global_sum={summed.item():.6f} global_tokens={tokens.item():.1f} "
                     f"cached_num_items={self._cached_num_items} ga_multiplier={ga_multiplier} "
-                    f"normalized_loss={normalized.item():.6f}"
+                    f"denominator={denominator.item():.1f} normalized_loss={normalized.item():.6f}"
                 )
             return normalized
 
@@ -1262,12 +1265,14 @@ def _patch_sft_trainer(trl_module) -> None:
                 input_ids = inputs.get("input_ids")
                 # Get first few tokens as identifier (before sharding)
                 id_preview = None
+                id_shape = None
                 if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0:
                     id_preview = input_ids.flatten()[:8].tolist()
+                    id_shape = tuple(input_ids.shape)
                 print(
                     f"[CP-GA-DEBUG][rank={rank}] num_items_in_batch={num_items_val} "
                     f"cached={manager._cached_num_items} ga_steps={manager._cached_ga_steps} "
-                    f"input_ids_preview={id_preview}"
+                    f"input_ids_shape={id_shape} input_ids_preview={id_preview}"
                 )
 
             kwargs.pop("num_items_in_batch", None)
