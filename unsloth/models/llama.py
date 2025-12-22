@@ -1145,6 +1145,19 @@ def LlamaAttention_fast_forward(
     )
     use_flash = (not cp_active) and HAS_FLASH_ATTENTION and attention_mask is None
 
+    # Debug: verify cp_active is True during attention forward
+    if (
+        os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1"
+        and getattr(self, "layer_idx", 0) == 0
+    ):
+        import torch.distributed as _dist
+
+        _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        print(
+            f"[CP-ATTN-DEBUG][rank={_rank}] layer_idx=0 cp_active={cp_active} "
+            f"use_flash={use_flash} use_xformers={use_xformers} Q.shape={tuple(Q.shape)}"
+        )
+
     if cp_active and (use_xformers or use_flash) and _cp_debug_enabled():
         _cp_debug(
             "[CP-DEBUG][attn] Context parallel requested but non-SDPA path selected; forcing SDPA."
