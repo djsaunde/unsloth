@@ -841,9 +841,9 @@ class ContextParallelManager:
         inputs.pop("num_items_in_batch", None)
 
     def consume_num_items_override(self):
-        # Don't return the cached value - we want the model to compute local token count
-        # The cached value is kept only for debugging purposes
-        self._cached_num_items = None
+        # Return None so the model uses local token count for loss computation.
+        # Keep _cached_num_items intact - reduce_loss will use it for proper
+        # gradient accumulation support.
         return None
 
     def _set_report_loss(self, value: torch.Tensor) -> None:
