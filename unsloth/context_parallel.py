@@ -1252,6 +1252,47 @@ def _patch_sft_trainer(trl_module) -> None:
                     if torch.is_tensor(num_items_val)
                     else num_items_val
                 )
+            else:
+                # num_items_in_batch not provided (model signature check may have failed)
+                # This can happen when unsloth's _unsloth_get_batch_samples determines
+                # the model doesn't accept **kwargs. Debug to understand why.
+                if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    # Check model structure to understand signature check failure
+                    m = model
+                    if hasattr(m, "get_base_model"):
+                        m = m.get_base_model()
+                    model_class = m.__class__.__name__
+                    forward_qualname = getattr(m.forward, "__qualname__", "N/A")
+                    import inspect
+
+                    try:
+                        sig = inspect.signature(m.forward)
+                        last_param = (
+                            list(sig.parameters.values())[-1]
+                            if sig.parameters
+                            else None
+                        )
+                        last_param_kind = last_param.kind if last_param else None
+                        has_kwargs = last_param_kind == inspect.Parameter.VAR_KEYWORD
+                    except:
+                        has_kwargs = "error"
+                    print(
+                        f"[CP-GA-DEBUG][rank={rank}] num_items_in_batch=None! "
+                        f"model_class={model_class} forward_qualname={forward_qualname} "
+                        f"has_kwargs={has_kwargs}"
+                    )
+                # Fallback: compute from labels (approximation for GA)
+                labels = inputs.get("labels")
+                if isinstance(labels, torch.Tensor):
+                    token_count = labels[..., 1:] != -100
+                    attention_mask = inputs.get("attention_mask")
+                    if isinstance(attention_mask, torch.Tensor):
+                        token_count = token_count & (attention_mask[..., 1:] != 0)
+                    local_count = token_count.sum()
+                    ga_steps = manager._cached_ga_steps
+                    # Note: This is an approximation assuming uniform batch sizes
+                    manager._cached_num_items = local_count.item() * ga_steps
 
             # Debug: verify num_items_in_batch and dataset items
             if os.environ.get("UNSLOTH_CP_DEBUG_GA") == "1":
