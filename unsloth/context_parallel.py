@@ -592,6 +592,117 @@ class ContextParallelManager:
             handle.remove()
         self._attention_hook_handles = []
 
+    def enter_sdpa_patch(self) -> None:
+        """
+        Manually enter SDPA patching for context parallel.
+
+        This patches F.scaled_dot_product_attention to use ring attention
+        and enables the CP dispatcher. Call exit_sdpa_patch() when done.
+
+        This is needed to keep SDPA patched during backward pass with
+        gradient checkpointing, which re-runs forward outside the normal
+        context_parallel context manager.
+        """
+        if not self.enabled or self._mesh is None:
+            return
+        if getattr(self, "_sdpa_patch_active", False):
+            return  # Already patched
+
+        try:
+            from torch.distributed.tensor.experimental._attention import (
+                _distribute_function,
+                _enable_cp_dispatcher,
+            )
+            from torch.distributed.tensor import DTensor, Shard
+            import itertools
+
+            seq_dim = 2  # Standard seq dimension for attention
+            mesh = self._mesh
+
+            def attention_input_fn(mesh, *args, **kwargs):
+                placement = [Shard(seq_dim)]
+                all_args = []
+                for arg in itertools.chain(args, kwargs.values()):
+                    if isinstance(arg, torch.Tensor) and not isinstance(arg, DTensor):
+                        arg = DTensor.from_local(arg, mesh, placement, run_check = False)
+                    all_args.append(arg)
+                new_args = tuple(all_args[0 : len(args)])
+                new_kwargs = dict(zip(kwargs.keys(), all_args[len(args) :]))
+                return new_args, new_kwargs
+
+            def attention_output_fn(mesh, outputs):
+                new_outputs = []
+                for output in (
+                    [outputs] if isinstance(outputs, torch.Tensor) else outputs
+                ):
+                    output = (
+                        output.to_local() if isinstance(output, DTensor) else output
+                    )
+                    new_outputs.append(output)
+                if isinstance(outputs, torch.Tensor):
+                    return new_outputs[0]
+                return tuple(new_outputs)
+
+            # Patch SDPA
+            _distribute_function(
+                F.scaled_dot_product_attention,
+                F,
+                mesh,
+                attention_input_fn,
+                attention_output_fn,
+            )
+
+            # Enable CP dispatcher
+            self._cp_dispatcher_ctx = _enable_cp_dispatcher()
+            self._cp_dispatcher_ctx.__enter__()
+
+            self._sdpa_patch_active = True
+
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                print(
+                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Entered SDPA patch for training step"
+                )
+
+        except Exception as e:
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                print(
+                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Failed to enter SDPA patch: {e}"
+                )
+
+    def exit_sdpa_patch(self) -> None:
+        """Exit SDPA patching that was entered with enter_sdpa_patch()."""
+        if not getattr(self, "_sdpa_patch_active", False):
+            return
+
+        try:
+            from torch.distributed.tensor.experimental._attention import (
+                _restore_function,
+            )
+
+            # Exit CP dispatcher
+            if (
+                hasattr(self, "_cp_dispatcher_ctx")
+                and self._cp_dispatcher_ctx is not None
+            ):
+                self._cp_dispatcher_ctx.__exit__(None, None, None)
+                self._cp_dispatcher_ctx = None
+
+            # Restore SDPA
+            _restore_function(F.scaled_dot_product_attention, F)
+
+            self._sdpa_patch_active = False
+
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                print(
+                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Exited SDPA patch for training step"
+                )
+
+        except Exception as e:
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                print(
+                    f"[CP-SDPA-PATCH][rank={self._cp_rank_index}] Failed to exit SDPA patch: {e}"
+                )
+
     def _verify_environment(self) -> None:
         if not self.enabled:
             if self.settings.size > 1 and context_parallel is None:
@@ -840,34 +951,110 @@ class ContextParallelManager:
                 except Exception:
                     pass
 
-            with context_parallel(
-                self._mesh,
-                buffers = buffers,
-                buffer_seq_dims = seq_dims,
-                no_restore_buffers = no_restore,
-            ):
-                # Load balancing debug: log values AFTER sharding
-                if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
-                    _rank = self._cp_rank_index
-                    sl = inputs.get("shift_labels")
-                    iids = inputs.get("input_ids")
-                    pids = inputs.get("position_ids")
-                    if sl is not None:
-                        sl_flat = sl.flatten().tolist()
-                        print(
-                            f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] shift_labels[:15]={sl_flat[:15]} shape={tuple(sl.shape)}"
-                        )
-                    if iids is not None:
-                        iids_flat = iids.flatten().tolist()
-                        print(
-                            f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] input_ids[:15]={iids_flat[:15]} shape={tuple(iids.shape)}"
-                        )
-                    if pids is not None:
-                        pids_flat = pids.flatten().tolist()
-                        print(
-                            f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] position_ids[:15]={pids_flat[:15]} shape={tuple(pids.shape)}"
-                        )
-                yield
+            # If SDPA is already patched (via enter_sdpa_patch), do buffer sharding only
+            # to avoid context_parallel's __exit__ from unpatching SDPA before backward
+            sdpa_already_patched = getattr(self, "_sdpa_patch_active", False)
+
+            if sdpa_already_patched:
+                # Manual buffer sharding without SDPA patching
+                try:
+                    from torch.distributed.tensor.experimental._attention import (
+                        _context_parallel_buffers,
+                    )
+
+                    # Shard buffers in-place
+                    original_buffers = [
+                        None if b in no_restore else b.clone() for b in buffers
+                    ]
+                    chunks = _context_parallel_buffers(self._mesh, buffers, seq_dims)
+                    for buffer, chunk in zip(buffers, chunks):
+                        chunk = chunk.clone()
+                        buffer.resize_(chunk.shape)
+                        buffer.copy_(chunk)
+
+                    # Load balancing debug: log values AFTER sharding
+                    if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                        _rank = self._cp_rank_index
+                        sl = inputs.get("shift_labels")
+                        iids = inputs.get("input_ids")
+                        pids = inputs.get("position_ids")
+                        if sl is not None:
+                            sl_flat = sl.flatten().tolist()
+                            print(
+                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] shift_labels[:15]={sl_flat[:15]} shape={tuple(sl.shape)}"
+                            )
+                        if iids is not None:
+                            iids_flat = iids.flatten().tolist()
+                            print(
+                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] input_ids[:15]={iids_flat[:15]} shape={tuple(iids.shape)}"
+                            )
+                        if pids is not None:
+                            pids_flat = pids.flatten().tolist()
+                            print(
+                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] position_ids[:15]={pids_flat[:15]} shape={tuple(pids.shape)}"
+                            )
+
+                    yield
+
+                    # Restore buffers that need restoration
+                    from torch.distributed.tensor.experimental._attention import (
+                        _cp_options,
+                        _RoundRobinLoadBalancer,
+                        _SequentialSharder,
+                    )
+
+                    sharder = (
+                        _RoundRobinLoadBalancer
+                        if _cp_options.enable_load_balance
+                        else _SequentialSharder
+                    )
+                    for buffer, orig, seq_dim in zip(
+                        buffers, original_buffers, seq_dims
+                    ):
+                        if orig is not None:
+                            # Need to unshard
+                            unsharded = sharder.unshard(buffer, self._mesh, seq_dim)
+                            buffer.resize_(orig.shape)
+                            buffer.copy_(orig)
+                except ImportError:
+                    # Fallback to context_parallel if imports fail
+                    with context_parallel(
+                        self._mesh,
+                        buffers = buffers,
+                        buffer_seq_dims = seq_dims,
+                        no_restore_buffers = no_restore,
+                    ):
+                        yield
+            else:
+                # Normal path: use context_parallel which handles both SDPA patching and buffer sharding
+                with context_parallel(
+                    self._mesh,
+                    buffers = buffers,
+                    buffer_seq_dims = seq_dims,
+                    no_restore_buffers = no_restore,
+                ):
+                    # Load balancing debug: log values AFTER sharding
+                    if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                        _rank = self._cp_rank_index
+                        sl = inputs.get("shift_labels")
+                        iids = inputs.get("input_ids")
+                        pids = inputs.get("position_ids")
+                        if sl is not None:
+                            sl_flat = sl.flatten().tolist()
+                            print(
+                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] shift_labels[:15]={sl_flat[:15]} shape={tuple(sl.shape)}"
+                            )
+                        if iids is not None:
+                            iids_flat = iids.flatten().tolist()
+                            print(
+                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] input_ids[:15]={iids_flat[:15]} shape={tuple(iids.shape)}"
+                            )
+                        if pids is not None:
+                            pids_flat = pids.flatten().tolist()
+                            print(
+                                f"[CP-LB-DEBUG][AFTER-SHARD][rank={_rank}] position_ids[:15]={pids_flat[:15]} shape={tuple(pids.shape)}"
+                            )
+                    yield
         finally:
             if token is not None:
                 _ACTIVE_MANAGER.reset(token)
@@ -1743,6 +1930,10 @@ def _patch_sft_trainer(trl_module) -> None:
                 model = getattr(self, "model", None)
                 if model is not None:
                     manager.attach_attention_hooks(model)
+            # Enter SDPA patch for the entire training step (forward + backward)
+            # This is needed because gradient checkpointing re-runs forward during
+            # backward, and we need SDPA to remain patched throughout.
+            manager.enter_sdpa_patch()
             # Note: static_graph is disabled because it causes internal PyTorch
             # assertion errors with unsloth's gradient checkpointing.
             # sync_each_batch keeps the graph constant instead.
@@ -1750,6 +1941,8 @@ def _patch_sft_trainer(trl_module) -> None:
             loss = original_training_step(self, *args, **kwargs)
         finally:
             if manager:
+                # Exit SDPA patch after backward completes
+                manager.exit_sdpa_patch()
                 setattr(self.args, "_n_gpu", original_n_gpu)
         report_loss = manager.consume_report_loss() if manager else None
         if manager and report_loss is not None:
