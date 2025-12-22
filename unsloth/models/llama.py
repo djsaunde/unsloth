@@ -2262,6 +2262,15 @@ def CausalLM_fast_forward(fast_forward_inference):
                 # Use unsloth_fused_ce_loss which actually calculates the best chunk size to reduce VRAM usage
                 RETURN_LOGITS = False
 
+            # Debug: trace code path
+            if os.environ.get("UNSLOTH_CP_DEBUG_LB") == "1":
+                import torch.distributed as _dist_path
+
+                _rank_path = _dist_path.get_rank() if _dist_path.is_initialized() else 0
+                print(
+                    f"[CP-LB-DEBUG][PATH][rank={_rank_path}] RETURN_LOGITS={RETURN_LOGITS} labels_is_tensor={torch.is_tensor(labels)} has_pre_shift_labels={has_pre_shift_labels} bsz={bsz} q_len={q_len}"
+                )
+
             if not RETURN_LOGITS and labels is not None:
                 n_items = kwargs.get("num_items_in_batch", None)
                 if n_items is None:
