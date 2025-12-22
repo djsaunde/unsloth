@@ -475,6 +475,47 @@ def _ensure_tuple_contains(values: Tuple[str, ...], name: str) -> Tuple[str, ...
     return values + (name,)
 
 
+def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
+    """
+    Attach forward_pre_hooks to self_attn modules to ensure correct attention
+    behavior during context parallelism with load balancing.
+
+    This mirrors accelerate's approach: remove attention_mask and set is_causal=True
+    to ensure ring attention works correctly with reordered tokens.
+
+    Args:
+        model: The model to attach hooks to
+
+    Returns:
+        List of hook handles that can be used to remove the hooks later
+    """
+    handles = []
+
+    def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
+        # Remove attention_mask and set is_causal=True
+        # This ensures ring attention uses causal masking correctly
+        if "attention_mask" in module_kwargs:
+            module_kwargs["attention_mask"] = None
+        if "is_causal" in module_kwargs or hasattr(_module, "is_causal"):
+            module_kwargs["is_causal"] = True
+        return module_args, module_kwargs
+
+    for name, module in model.named_modules():
+        # Attach to modules ending with self_attn (transformers convention)
+        if name.endswith("self_attn"):
+            handle = module.register_forward_pre_hook(
+                _self_attn_pre_forward_hook, with_kwargs = True, prepend = True
+            )
+            handles.append(handle)
+
+    if handles and int(os.environ.get("RANK", "0")) == 0:
+        print(
+            f"Context parallelism: attached attention hooks to {len(handles)} self_attn modules"
+        )
+
+    return handles
+
+
 class ContextParallelManager:
     """Encapsulates everything needed to toggle PyTorch context parallelism."""
 
@@ -498,10 +539,31 @@ class ContextParallelManager:
         self._report_tokens: Optional[torch.Tensor] = None
         self._last_global_seq_len: Optional[int] = None
         self._debug_raw_input_ids: Optional[torch.Tensor] = None
+        self._attention_hook_handles: list = []
         self._verify_environment()
         if self.enabled:
             self._mesh = self._build_mesh()
             self._accelerate_mesh = self._build_accelerate_mesh()
+
+    def attach_attention_hooks(self, model: torch.nn.Module) -> None:
+        """
+        Attach hooks to self_attn modules to ensure correct attention behavior
+        during context parallelism with load balancing.
+
+        This should be called once after the model is available.
+        """
+        if not self.enabled:
+            return
+        if self._attention_hook_handles:
+            # Already attached
+            return
+        self._attention_hook_handles = _attach_context_parallel_attention_hooks(model)
+
+    def remove_attention_hooks(self) -> None:
+        """Remove previously attached attention hooks."""
+        for handle in self._attention_hook_handles:
+            handle.remove()
+        self._attention_hook_handles = []
 
     def _verify_environment(self) -> None:
         if not self.enabled:
@@ -1266,6 +1328,13 @@ def _patch_sft_trainer(trl_module) -> None:
                         "Context parallelism: enabled sync_each_batch for gradient "
                         "accumulation compatibility (syncing gradients every batch)."
                     )
+
+        # Attach attention hooks for proper ring attention behavior with load balancing.
+        # This ensures attention_mask is removed and is_causal=True for all self_attn calls.
+        if manager and manager.enabled:
+            model = getattr(self, "model", None)
+            if model is not None:
+                manager.attach_attention_hooks(model)
 
     def _maybe_enable_ddp_static_graph(trainer):
         ddp_model = getattr(trainer, "model_wrapped", None)
