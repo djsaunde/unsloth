@@ -284,3 +284,7 @@ from unsloth_zoo.rl_environments import (
 
 # Patch TRL trainers for backwards compatibility
 _patch_trl_trainer()
+
+from .context_parallel import patch_trl_for_context_parallel
+
+patch_trl_for_context_parallel()

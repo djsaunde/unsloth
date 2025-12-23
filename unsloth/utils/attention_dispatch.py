@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 from torch import Tensor
-from torch.nn.functional import scaled_dot_product_attention
+import torch.nn.functional as F
 
 from ..models._utils import *
 from ..utils.packing import (
@@ -35,7 +35,7 @@ HAS_XFORMERS = xformers is not None
 BlockDiagonalCausalMask = None
 if HAS_XFORMERS:
     BlockDiagonalCausalMask = xformers.attn_bias.BlockDiagonalCausalMask
-SDPA_HAS_GQA = "enable_gqa" in (scaled_dot_product_attention.__doc__ or "")
+SDPA_HAS_GQA = "enable_gqa" in (F.scaled_dot_product_attention.__doc__ or "")
 
 FLASH_VARLEN = "flash_varlen"
 FLASH_DENSE = "flash_dense"
@@ -251,7 +251,7 @@ def run_attention(
 
         if SDPA_HAS_GQA:
             kwargs.setdefault("enable_gqa", config.n_groups != 1)
-            out = scaled_dot_product_attention(Q, K, V, **kwargs)
+            out = F.scaled_dot_product_attention(Q, K, V, **kwargs)
             return out.transpose(1, 2)
 
         K_mod = K
@@ -266,7 +266,7 @@ def run_attention(
             K_mod = K_mod.reshape(bsz, n_heads, kv_seq_len, head_dim)
             V_mod = V_mod.reshape(bsz, n_heads, kv_seq_len, head_dim)
 
-        out = scaled_dot_product_attention(
+        out = F.scaled_dot_product_attention(
             Q.contiguous(),
             K_mod.contiguous(),
             V_mod.contiguous(),
