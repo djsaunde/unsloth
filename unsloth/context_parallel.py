@@ -212,11 +212,6 @@ def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
         )
         handles.append(handle)
 
-    if handles and int(os.environ.get("RANK", "0")) == 0:
-        print(
-            f"Context parallelism: attached attention hooks to {len(handles)} self_attn modules"
-        )
-
     return handles
 
 
@@ -981,11 +976,6 @@ def _patch_sft_trainer(trl_module) -> None:
                     and distributed_state.distributed_type == DistributedType.MULTI_GPU
                 ):
                     distributed_state.distributed_type = DistributedType.NO
-                    if int(os.environ.get("RANK", "0")) == 0:
-                        print(
-                            "Context parallelism: disabled DDP for pure CP mode "
-                            "(dp_world_size=1, no data parallelism needed)."
-                        )
             except ImportError:
                 pass
 
@@ -1003,11 +993,6 @@ def _patch_sft_trainer(trl_module) -> None:
             )
             if grad_accum_steps > 1:
                 accelerator.gradient_state.plugin_kwargs["sync_each_batch"] = True
-                if int(os.environ.get("RANK", "0")) == 0:
-                    print(
-                        "Context parallelism: enabled sync_each_batch for gradient "
-                        "accumulation compatibility (syncing gradients every batch)."
-                    )
 
         # Attach attention hooks for proper ring attention behavior with load balancing.
         # This ensures attention_mask is removed and is_causal=True for all self_attn calls.
@@ -1015,10 +1000,6 @@ def _patch_sft_trainer(trl_module) -> None:
             model = getattr(self, "model", None)
             if model is not None:
                 manager.attach_attention_hooks(model)
-            elif int(os.environ.get("RANK", "0")) == 0:
-                print(
-                    "Context parallelism: WARNING - model not available at init time for hook attachment"
-                )
 
     def _maybe_enable_ddp_static_graph(trainer):
         ddp_model = getattr(trainer, "model_wrapped", None)
@@ -1030,8 +1011,6 @@ def _patch_sft_trainer(trl_module) -> None:
         try:
             enable_fn()
             setattr(ddp_model, "_unsloth_context_parallel_static_graph", True)
-            if int(os.environ.get("RANK", "0")) == 0:
-                print("Enabled DDP static-graph mode for context parallelism.")
         except Exception:
             pass
 
@@ -1181,11 +1160,6 @@ def _patch_sft_trainer(trl_module) -> None:
 
         if is_checkpointing and grad_accum_steps > 1:
             accelerator.gradient_state.plugin_kwargs["sync_each_batch"] = True
-            if int(os.environ.get("RANK", "0")) == 0:
-                print(
-                    "Context parallelism: enabled sync_each_batch for gradient "
-                    "checkpointing + gradient accumulation compatibility."
-                )
 
     @functools.wraps(original_training_step)
     def patched_training_step(self, *args, **kwargs):

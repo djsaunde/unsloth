@@ -141,11 +141,6 @@ def run(args):
     pad_multiple = args.pad_to_multiple_of
     if pad_multiple is None and args.context_parallel_size > 1:
         pad_multiple = 2 * args.context_parallel_size
-        if int(os.environ.get("RANK", "0")) == 0:
-            print(
-                f"Context parallelism enabled with size {args.context_parallel_size}; "
-                f"auto-setting pad_to_multiple_of={pad_multiple}."
-            )
 
     training_args = SFTConfig(
         per_device_train_batch_size = args.per_device_train_batch_size,
