@@ -31,6 +31,7 @@ class RingAttnVariant(Enum):
 
 # Try importing ring-flash-attention functions
 HAS_RING_FLASH_ATTN = False
+ring_flash_attn_func = None
 zigzag_ring_flash_attn_func = None
 zigzag_ring_flash_attn_varlen_func = None
 llama3_flash_attn_varlen_func = None
@@ -43,6 +44,7 @@ use_ring_attn = None
 
 try:
     from ring_flash_attn import (
+        ring_flash_attn_func as _ring_dense,
         zigzag_ring_flash_attn_func as _zigzag_dense,
         zigzag_ring_flash_attn_varlen_func as _zigzag_varlen,
         llama3_flash_attn_varlen_func as _llama3_varlen,
@@ -56,6 +58,7 @@ try:
         use_ring_attn as _use_ring,
     )
 
+    ring_flash_attn_func = _ring_dense
     zigzag_ring_flash_attn_func = _zigzag_dense
     zigzag_ring_flash_attn_varlen_func = _zigzag_varlen
     llama3_flash_attn_varlen_func = _llama3_varlen
@@ -97,8 +100,11 @@ def get_ring_attn_func(
         # AUTO and LLAMA3 both use llama3 for varlen
         return llama3_flash_attn_varlen_func
     else:
-        # For dense mode, use zigzag for best performance
-        return zigzag_ring_flash_attn_func
+        # For dense mode, use basic ring attention for correctness with contiguous sharding.
+        # zigzag is more load-balanced but expects zigzag-sharded data.
+        if variant == RingAttnVariant.ZIGZAG:
+            return zigzag_ring_flash_attn_func
+        return ring_flash_attn_func
 
 
 def parse_ring_attn_variant(variant_str: str) -> RingAttnVariant:
