@@ -21,8 +21,13 @@ except (ImportError, AttributeError):
     DeviceMesh = None
 
 from .device_type import DEVICE_TYPE_TORCH
-from .utils.packing import mask_packed_sequence_boundaries
-from .utils.ring_attention import is_ring_flash_attn_available
+from .utils.packing import mask_packed_sequence_boundaries, get_packed_info_from_kwargs
+from .utils.ring_attention import (
+    is_ring_flash_attn_available,
+    substitute_hf_flash_attn,
+    update_ring_flash_attn_params,
+    use_ring_attn,
+)
 
 _ACTIVE_MANAGER: contextvars.ContextVar[Optional["ContextParallelManager"]] = (
     contextvars.ContextVar("unsloth_active_cp_manager", default = None)
@@ -112,6 +117,8 @@ def _attach_context_parallel_attention_hooks(
 class ContextParallelManager:
     """Toggles PyTorch context parallelism."""
 
+    _hf_adapter_patched: bool = False  # Class-level flag for HF adapter
+
     def __init__(self, settings: ContextParallelSettings):
         self.settings = settings
         self._mesh: Optional[DeviceMesh] = None
@@ -122,8 +129,11 @@ class ContextParallelManager:
         self._world_size: int = dist.get_world_size()
         self._report_loss: Optional[torch.Tensor] = None
         self._attention_hook_handles: list = []
+        self._varlen_cu_seqlens: Optional[torch.Tensor] = None  # Global cu_seqlens for varlen
         self._mesh = self._build_mesh()
         self._device_mesh = self._build_device_mesh()
+        # Patch HF adapter if ring-flash-attn is available
+        self._ensure_hf_adapter_patched()
 
     def attach_attention_hooks(self, model: torch.nn.Module) -> None:
         """
@@ -155,6 +165,21 @@ class ContextParallelManager:
             DEVICE_TYPE_TORCH, mesh, mesh_dim_names = ("dp_replicate", "cp")
         )
 
+    def _ensure_hf_adapter_patched(self) -> None:
+        """Patch HF's flash attention with ring-flash-attn if available."""
+        if ContextParallelManager._hf_adapter_patched:
+            return
+        if not is_ring_flash_attn_available():
+            return
+        if substitute_hf_flash_attn is None:
+            return
+        try:
+            # heads_k_stride=1 works for most models (GQA included)
+            substitute_hf_flash_attn(self._cp_group, heads_k_stride = 1)
+            ContextParallelManager._hf_adapter_patched = True
+        except Exception as e:
+            warnings.warn(f"Failed to patch HF flash attention for ring-flash-attn: {e}")
+
     @property
     def device_mesh(self) -> Optional[DeviceMesh]:
         return self._device_mesh
@@ -176,6 +201,16 @@ class ContextParallelManager:
     def use_ring_flash_attn(self) -> bool:
         """Whether to use ring-flash-attention instead of PyTorch's context_parallel."""
         return is_ring_flash_attn_available()
+
+    @property
+    def varlen_cu_seqlens(self) -> Optional[torch.Tensor]:
+        """Global cu_seqlens for varlen mode (None if not in varlen mode)."""
+        return self._varlen_cu_seqlens
+
+    @property
+    def is_varlen_active(self) -> bool:
+        """Whether we're currently in varlen/packing mode."""
+        return self._varlen_cu_seqlens is not None
 
     def data_parallel_rank(self) -> int:
         return dist.get_rank() // self.settings.size
@@ -228,6 +263,31 @@ class ContextParallelManager:
             # In-place narrow to avoid memory copy
             buf.data = buf.narrow(seq_dim, start, chunk_size).contiguous()
 
+    def _is_varlen_mode(self, inputs: dict[str, torch.Tensor]) -> bool:
+        """Check if we're in varlen (packing) mode."""
+        return inputs.get("packed_seq_lengths") is not None
+
+    def _setup_varlen_ring_params(self, inputs: dict[str, torch.Tensor]) -> None:
+        """Set up ring attention parameters for varlen mode."""
+        packed_seq_lengths = inputs.get("packed_seq_lengths")
+        if packed_seq_lengths is None:
+            self._varlen_cu_seqlens = None
+            return
+
+        # Compute cu_seqlens from packed_seq_lengths
+        device = packed_seq_lengths.device
+        lengths = packed_seq_lengths.to(dtype = torch.int32)
+        cu_seqlens = torch.zeros(lengths.numel() + 1, dtype = torch.int32, device = device)
+        torch.cumsum(lengths, dim = 0, out = cu_seqlens[1:])
+        self._varlen_cu_seqlens = cu_seqlens
+
+        # Update ring attention params via HF adapter
+        if update_ring_flash_attn_params is not None and self._cp_group is not None:
+            try:
+                update_ring_flash_attn_params(cu_seqlens, self._cp_group)
+            except Exception as e:
+                warnings.warn(f"Failed to update ring attention params: {e}")
+
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
         """Wrap training step to shard buffers for ring attention."""
@@ -236,14 +296,32 @@ class ContextParallelManager:
         self._ensure_shift_labels(inputs)
         buffers, seq_dims, no_restore = self._collect_buffers(inputs)
 
+        is_varlen = self._is_varlen_mode(inputs)
+
         if self.use_ring_flash_attn:
-            # When using ring-flash-attn, we only need to shard buffers.
-            # Ring-flash-attn handles all ring communication internally via cp_group.
-            self._shard_buffers(buffers, seq_dims)
-            try:
-                yield
-            finally:
-                _ACTIVE_MANAGER.reset(token)
+            if is_varlen:
+                # Varlen mode with ring-flash-attn:
+                # - Set up global cu_seqlens BEFORE sharding
+                # - Then shard input buffers (each rank processes local tokens)
+                # - Ring attention handles K/V communication
+                self._setup_varlen_ring_params(inputs)
+                self._shard_buffers(buffers, seq_dims)
+                if use_ring_attn is not None:
+                    use_ring_attn(True)
+                try:
+                    yield
+                finally:
+                    if use_ring_attn is not None:
+                        use_ring_attn(False)
+                    self._varlen_cu_seqlens = None
+                    _ACTIVE_MANAGER.reset(token)
+            else:
+                # Dense mode: shard buffers as before
+                self._shard_buffers(buffers, seq_dims)
+                try:
+                    yield
+                finally:
+                    _ACTIVE_MANAGER.reset(token)
         else:
             # Fall back to PyTorch's built-in context_parallel (SDPA-based)
             with context_parallel(

@@ -237,28 +237,23 @@ def run_attention(
         cp_manager = get_cp_manager()
         ring_attn_fn = get_ring_attn_func(use_varlen = True)
 
-        if context.seq_info is None:
-            raise ValueError("RING_FLASH_VARLEN requires seq_info for packed sequences")
+        # Get global cu_seqlens from cp_manager (computed before sharding)
+        cu_seqlens_global = cp_manager.varlen_cu_seqlens
+        if cu_seqlens_global is None:
+            raise ValueError("RING_FLASH_VARLEN requires cu_seqlens for packed sequences")
 
-        _, cu_seqlens_global, _ = context.seq_info
+        # Ensure cu_seqlens is on the same device as Q/K/V
+        cu_seqlens_global = cu_seqlens_global.to(device = Q.device)
+
         causal = flash_varlen_kwargs.get("causal", True)
         world_size = cp_manager.settings.size
 
-        # Verify global cu_seqlens is aligned for ring attention
-        global_total = int(cu_seqlens_global[-1].item())
-        if global_total % world_size != 0:
-            raise ValueError(
-                f"RING_FLASH_VARLEN requires global total_length ({global_total}) "
-                f"to be divisible by world_size ({world_size}). "
-                f"Ensure pad_to_multiple_of is set correctly."
-            )
-
-        # Ring-flash-attn varlen expects (total_tokens, H, D) with contiguous tensors
-        # Q/K/V are already sharded by CP manager, so bsz * q_len = local tokens
+        # Q/K/V are already LOCAL (pre-sharded by context_parallel.apply)
+        # Reshape to (local_tokens, heads, head_dim) for varlen format
         local_tokens = bsz * q_len
-        Q_f = Q.transpose(1, 2).reshape(local_tokens, n_heads, head_dim).contiguous()
-        K_f = K.transpose(1, 2).reshape(local_tokens, config.n_kv_heads, head_dim).contiguous()
-        V_f = V.transpose(1, 2).reshape(local_tokens, config.n_kv_heads, head_dim).contiguous()
+        Q_local = Q.transpose(1, 2).reshape(local_tokens, n_heads, head_dim).contiguous()
+        K_local = K.transpose(1, 2).reshape(local_tokens, config.n_kv_heads, head_dim).contiguous()
+        V_local = V.transpose(1, 2).reshape(local_tokens, config.n_kv_heads, head_dim).contiguous()
 
         # Use llama3_flash_attn_prepare_cu_seqlens to compute local cu_seqlens
         # from global cu_seqlens for this rank
@@ -275,35 +270,25 @@ def run_attention(
             world_size = world_size,
         )
 
-        # Verify local cu_seqlens matches local tensor size
-        local_total_q = int(cu_seqlens_q[-1].item())
-        if local_total_q != local_tokens:
-            raise ValueError(
-                f"Shape mismatch: Q_f has {local_tokens} tokens but "
-                f"cu_seqlens_q expects {local_total_q}. "
-                f"cu_seqlens_global={cu_seqlens_global.tolist()}, "
-                f"cu_seqlens_q={cu_seqlens_q.tolist()}, "
-                f"rank={cp_manager.cp_rank_index}, world_size={world_size}"
-            )
-
         # Debug: Check for nan/inf in inputs
         import os
         if os.environ.get("UNSLOTH_DEBUG_RING_ATTN"):
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
-            q_has_nan = Q_f.isnan().any().item()
-            k_has_nan = K_f.isnan().any().item()
-            v_has_nan = V_f.isnan().any().item()
-            print(f"[Rank {rank}] RING_FLASH_VARLEN input shapes: Q={Q_f.shape}, K={K_f.shape}, V={V_f.shape}")
+            q_has_nan = Q_local.isnan().any().item()
+            k_has_nan = K_local.isnan().any().item()
+            v_has_nan = V_local.isnan().any().item()
+            print(f"[Rank {rank}] RING_FLASH_VARLEN local shapes: Q={Q_local.shape}, K={K_local.shape}, V={V_local.shape}")
             print(f"[Rank {rank}] Input has nan: Q={q_has_nan}, K={k_has_nan}, V={v_has_nan}")
+            print(f"[Rank {rank}] cu_seqlens_global={cu_seqlens_global.tolist()}")
             print(f"[Rank {rank}] cu_seqlens_q={cu_seqlens_q.tolist()}, cu_seqlens_k={cu_seqlens_k.tolist()}")
             print(f"[Rank {rank}] max_seqlen_q={max_seqlen_q}, max_seqlen_k={max_seqlen_k}")
             print(f"[Rank {rank}] local_k_slice={local_k_slice}")
 
         out = ring_attn_fn(
-            Q_f,
-            K_f,
-            V_f,
+            Q_local,
+            K_local,
+            V_local,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
@@ -323,6 +308,7 @@ def run_attention(
             if not out_has_nan and not out_has_inf:
                 print(f"[Rank {rank}] Output range: [{out.min().item():.4f}, {out.max().item():.4f}]")
 
+        # Output has shape (local_tokens, n_heads, head_dim)
         return out.view(bsz, q_len, n_heads, head_dim)
     elif backend == XFORMERS:
         attn_bias = build_xformers_block_causal_mask(
