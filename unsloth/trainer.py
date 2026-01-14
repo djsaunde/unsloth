@@ -318,13 +318,18 @@ def _patch_sft_trainer_auto_packing(trl_module):
         cp_size = getattr(config_arg, "context_parallel_size", 1) or 1
         is_context_parallel = cp_size > 1
 
+        # CP only blocks packing when ring-flash-attn is not available
+        from unsloth.utils.ring_attention import is_ring_flash_attn_available
+
+        cp_blocks_packing = is_context_parallel and not is_ring_flash_attn_available()
+
         # Block packing/padding-free for incompatible configurations
         blocked = (
             (data_collator is not None)
             or isinstance(processing_class, ProcessorMixin)
             or is_vlm
             or is_unsupported_model
-            or is_context_parallel  # CP uses ring attention which doesn't support packed masks
+            or cp_blocks_packing
             or (
                 os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
             )  # Disable padding free on forced logits
@@ -345,8 +350,8 @@ def _patch_sft_trainer_auto_packing(trl_module):
                 reason = "vision-language model"
             elif is_unsupported_model:
                 reason = f"unsupported model type(s): {', '.join(model_types)}"
-            elif is_context_parallel:
-                reason = "context parallelism enabled"
+            elif cp_blocks_packing:
+                reason = "context parallelism enabled (install ring-flash-attn for packing support)"
             message = "Unsloth: Sample packing/padding-free skipped " f"({reason})."
             print(message)
 

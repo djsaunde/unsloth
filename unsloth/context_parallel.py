@@ -22,6 +22,7 @@ except (ImportError, AttributeError):
 
 from .device_type import DEVICE_TYPE_TORCH
 from .utils.packing import mask_packed_sequence_boundaries
+from .utils.ring_attention import is_ring_flash_attn_available
 
 _ACTIVE_MANAGER: contextvars.ContextVar[Optional["ContextParallelManager"]] = (
     contextvars.ContextVar("unsloth_active_cp_manager", default = None)
@@ -51,22 +52,36 @@ class ContextParallelSettings:
             )
         },
     )
+    ring_attn_variant: str = field(
+        default = "auto",
+        metadata = {
+            "help": (
+                "Ring attention variant for context parallelism. Options: "
+                "'zigzag' (~70% of single-GPU FA), 'auto' (best available). "
+                "Only used when ring-flash-attn is installed."
+            )
+        },
+    )
 
     @classmethod
     def from_args(cls, args: Optional[object]) -> "ContextParallelSettings":
         if args is None:
             return cls()
         size = int(getattr(args, "context_parallel_size", 1))
-        return cls(size = size)
+        ring_attn_variant = str(getattr(args, "ring_attn_variant", "auto"))
+        return cls(size = size, ring_attn_variant = ring_attn_variant)
 
 
-def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
+def _attach_context_parallel_attention_hooks(
+    model: torch.nn.Module, use_ring_flash: bool = False
+) -> list:
     """
     Attach forward_pre_hooks to self_attn modules to ensure correct attention behavior
     during context parallelism with load balancing.
 
     Args:
         model: The model to attach hooks to
+        use_ring_flash: Whether ring-flash-attention is being used
 
     Returns:
         List of hook handles that can be used to remove the hooks later
@@ -74,9 +89,9 @@ def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
     handles = []
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
-        # Remove attention_mask and set is_causal=True
-        # This ensures ring attention uses causal masking correctly
-        if "attention_mask" in module_kwargs:
+        # PyTorch's context_parallel needs attention_mask removed;
+        # ring-flash-attn keeps it for packed sequence boundary handling
+        if not use_ring_flash and "attention_mask" in module_kwargs:
             module_kwargs["attention_mask"] = None
         if "is_causal" in module_kwargs or hasattr(_module, "is_causal"):
             module_kwargs["is_causal"] = True
@@ -116,7 +131,9 @@ class ContextParallelManager:
         """
         if self._attention_hook_handles:
             return
-        self._attention_hook_handles = _attach_context_parallel_attention_hooks(model)
+        self._attention_hook_handles = _attach_context_parallel_attention_hooks(
+            model, use_ring_flash = self.use_ring_flash_attn
+        )
 
     def _build_mesh(self) -> DeviceMesh:
         rank = torch.distributed.get_rank()
@@ -148,6 +165,16 @@ class ContextParallelManager:
     @property
     def cp_rank_index(self) -> int:
         return self._cp_rank_index
+
+    @property
+    def cp_group(self) -> Optional[dist.ProcessGroup]:
+        """Get the process group for CP communication (used by ring-flash-attn)."""
+        return self._cp_group
+
+    @property
+    def use_ring_flash_attn(self) -> bool:
+        """Whether to use ring-flash-attention instead of PyTorch's context_parallel."""
+        return is_ring_flash_attn_available()
 
     def data_parallel_rank(self) -> int:
         return dist.get_rank() // self.settings.size
@@ -189,22 +216,43 @@ class ContextParallelManager:
             mask_packed_sequence_boundaries(shift_labels, packed_seq_lengths)
         inputs["shift_labels"] = shift_labels
 
+    def _shard_buffers(
+        self, buffers: list[torch.Tensor], seq_dims: list[int]
+    ) -> None:
+        """Shard buffers along sequence dimension for the current CP rank."""
+        for buf, seq_dim in zip(buffers, seq_dims):
+            total_seq_len = buf.size(seq_dim)
+            chunk_size = total_seq_len // self.settings.size
+            start = self._cp_rank_index * chunk_size
+            # In-place narrow to avoid memory copy
+            buf.data = buf.narrow(seq_dim, start, chunk_size).contiguous()
+
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
-        """Wrap training step to shard buffers and patch SDPA for ring attention."""
+        """Wrap training step to shard buffers for ring attention."""
         token = _ACTIVE_MANAGER.set(self)
         self._ensure_position_ids(inputs)
         self._ensure_shift_labels(inputs)
         buffers, seq_dims, no_restore = self._collect_buffers(inputs)
 
-        with context_parallel(
-            self._mesh,
-            buffers = buffers,
-            buffer_seq_dims = seq_dims,
-            no_restore_buffers = no_restore,
-        ):
-            yield
-        _ACTIVE_MANAGER.reset(token)
+        if self.use_ring_flash_attn:
+            # When using ring-flash-attn, we only need to shard buffers.
+            # Ring-flash-attn handles all ring communication internally via cp_group.
+            self._shard_buffers(buffers, seq_dims)
+            try:
+                yield
+            finally:
+                _ACTIVE_MANAGER.reset(token)
+        else:
+            # Fall back to PyTorch's built-in context_parallel (SDPA-based)
+            with context_parallel(
+                self._mesh,
+                buffers = buffers,
+                buffer_seq_dims = seq_dims,
+                no_restore_buffers = no_restore,
+            ):
+                yield
+            _ACTIVE_MANAGER.reset(token)
 
     def _set_report_loss(self, value: torch.Tensor) -> None:
         self._report_loss = value.detach() if torch.is_tensor(value) else None
@@ -260,6 +308,16 @@ def patch_sft_config():
                 "help": (
                     "Number of ranks participating in context parallelism. "
                     "Set to 1 to disable context parallelism."
+                )
+            },
+        )
+        ring_attn_variant: str = field(
+            default = "auto",
+            metadata = {
+                "help": (
+                    "Ring attention variant for context parallelism. Options: "
+                    "'zigzag' (~70% of single-GPU FA), 'auto' (best available). "
+                    "Only used when ring-flash-attn is installed."
                 )
             },
         )

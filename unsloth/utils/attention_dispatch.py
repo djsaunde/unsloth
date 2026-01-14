@@ -29,6 +29,11 @@ from ..utils.packing import (
     build_sdpa_packed_attention_mask,
     build_xformers_block_causal_mask,
 )
+from ..utils.ring_attention import (
+    is_ring_flash_attn_available,
+    get_ring_attn_func,
+    RingAttnVariant,
+)
 
 if HAS_FLASH_ATTENTION:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -42,6 +47,8 @@ FLASH_VARLEN = "flash_varlen"
 FLASH_DENSE = "flash_dense"
 XFORMERS = "xformers"
 SDPA = "sdpa"
+RING_FLASH_DENSE = "ring_flash_dense"
+RING_FLASH_VARLEN = "ring_flash_varlen"
 
 _CP_SDPA_FALLBACK_LOGGED = False
 
@@ -91,21 +98,31 @@ class AttentionContext:
 def select_attention_backend(use_varlen: bool = False) -> str:
     """Return attention backend based on availability / priority order."""
 
-    # Context parallelism requires SDPA
-    # TODO(djsaunde): integrate ring-flash-attn for FA CP support
     cp_manager = get_cp_manager()
     if cp_manager is not None:
-        if use_varlen:
-            raise ValueError(
-                "Context parallelism does not support varlen/packing mode. "
-                "Disable packing or set context_parallel_size=1."
-            )
-        global _CP_SDPA_FALLBACK_LOGGED
-        if not _CP_SDPA_FALLBACK_LOGGED:
-            print("Unsloth: Context parallelism requires SDPA backend).")
-            _CP_SDPA_FALLBACK_LOGGED = True
-        return SDPA
+        # Context parallelism active - check for ring-flash-attn
+        if cp_manager.use_ring_flash_attn:
+            # Ring-flash-attention available - use it
+            if use_varlen:
+                return RING_FLASH_VARLEN
+            return RING_FLASH_DENSE
+        else:
+            # Fall back to SDPA-based CP (no varlen support)
+            if use_varlen:
+                raise ValueError(
+                    "Context parallelism with SDPA does not support varlen/packing mode. "
+                    "Install ring-flash-attention (`pip install ring-flash-attn`) for packing support, "
+                    "or disable packing, or set context_parallel_size=1."
+                )
+            global _CP_SDPA_FALLBACK_LOGGED
+            if not _CP_SDPA_FALLBACK_LOGGED:
+                print(
+                    "Unsloth: Context parallelism using SDPA backend (ring-flash-attn not installed)."
+                )
+                _CP_SDPA_FALLBACK_LOGGED = True
+            return SDPA
 
+    # Standard single-GPU path
     if HAS_FLASH_ATTENTION:
         if use_varlen:
             return FLASH_VARLEN
@@ -175,6 +192,51 @@ def run_attention(
         return flash_attn_func(Q_t, K_t, V_t, **flash_dense_kwargs).reshape(
             bsz, q_len, n_heads, head_dim
         )
+    elif backend == RING_FLASH_DENSE:
+        cp_manager = get_cp_manager()
+        ring_attn_fn = get_ring_attn_func(use_varlen = False)
+
+        # Ring-flash-attn expects (B, S, H, D) layout
+        Q_t = Q.transpose(1, 2)
+        K_t = K.transpose(1, 2)
+        V_t = V.transpose(1, 2)
+
+        out = ring_attn_fn(
+            Q_t,
+            K_t,
+            V_t,
+            dropout_p = flash_dense_kwargs.get("dropout_p", 0.0),
+            causal = flash_dense_kwargs.get("causal", True),
+            group = cp_manager.cp_group,
+        )
+        return out.view(bsz, q_len, n_heads, head_dim)
+    elif backend == RING_FLASH_VARLEN:
+        cp_manager = get_cp_manager()
+        ring_attn_fn = get_ring_attn_func(use_varlen = True)
+
+        if context.seq_info is None:
+            raise ValueError("RING_FLASH_VARLEN requires seq_info for packed sequences")
+
+        _, cu_seqlens, max_seqlen = context.seq_info
+
+        # Ring-flash-attn varlen expects (total_tokens, H, D)
+        Q_f = Q.transpose(1, 2).reshape(bsz * q_len, n_heads, head_dim)
+        K_f = K.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
+        V_f = V.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
+
+        out = ring_attn_fn(
+            Q_f,
+            K_f,
+            V_f,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            dropout_p = flash_varlen_kwargs.get("dropout_p", 0.0),
+            causal = flash_varlen_kwargs.get("causal", True),
+            group = cp_manager.cp_group,
+        )
+        return out.view(bsz, q_len, n_heads, head_dim)
     elif backend == XFORMERS:
         attn_bias = build_xformers_block_causal_mask(
             context.seq_info,
@@ -298,4 +360,10 @@ __all__ = [
     "AttentionContext",
     "select_attention_backend",
     "run_attention",
+    "FLASH_VARLEN",
+    "FLASH_DENSE",
+    "XFORMERS",
+    "SDPA",
+    "RING_FLASH_DENSE",
+    "RING_FLASH_VARLEN",
 ]
