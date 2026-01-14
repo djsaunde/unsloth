@@ -279,6 +279,36 @@ class ContextParallelManager:
         lengths = packed_seq_lengths.to(dtype = torch.int32)
         cu_seqlens = torch.zeros(lengths.numel() + 1, dtype = torch.int32, device = device)
         torch.cumsum(lengths, dim = 0, out = cu_seqlens[1:])
+
+        # Ring attention requires total_length % world_size == 0
+        # Get actual tensor length and ensure cu_seqlens covers it
+        input_ids = inputs.get("input_ids")
+        if input_ids is not None:
+            tensor_seq_len = input_ids.size(1)  # (batch, seq_len)
+            real_total = int(cu_seqlens[-1].item())
+
+            # Round up to next multiple of CP size
+            cp_size = self.settings.size
+            padded_len = ((tensor_seq_len + cp_size - 1) // cp_size) * cp_size
+
+            # If tensor has padding beyond real sequences, extend cu_seqlens
+            if padded_len > real_total:
+                cu_seqlens = torch.cat([
+                    cu_seqlens,
+                    torch.tensor([padded_len], dtype = torch.int32, device = device)
+                ])
+
+            # Pad input_ids if needed for divisibility
+            if tensor_seq_len != padded_len:
+                pad_amount = padded_len - tensor_seq_len
+                inputs["input_ids"] = F.pad(input_ids, (0, pad_amount), value = 0)
+                # Also pad other buffers that will be sharded
+                for key in ("attention_mask", "labels", "position_ids", "shift_labels"):
+                    tensor = inputs.get(key)
+                    if tensor is not None and tensor.ndim >= 2:
+                        pad_val = -100 if key in ("labels", "shift_labels") else 0
+                        inputs[key] = F.pad(tensor, (0, pad_amount), value = pad_val)
+
         self._varlen_cu_seqlens = cu_seqlens
 
         # Update ring attention params via HF adapter
@@ -294,17 +324,18 @@ class ContextParallelManager:
         token = _ACTIVE_MANAGER.set(self)
         self._ensure_position_ids(inputs)
         self._ensure_shift_labels(inputs)
-        buffers, seq_dims, no_restore = self._collect_buffers(inputs)
 
         is_varlen = self._is_varlen_mode(inputs)
 
         if self.use_ring_flash_attn:
             if is_varlen:
                 # Varlen mode with ring-flash-attn:
-                # - Set up global cu_seqlens BEFORE sharding
-                # - Then shard input buffers (each rank processes local tokens)
+                # - Set up global cu_seqlens and pad buffers for divisibility
+                # - Then collect and shard input buffers
                 # - Ring attention handles K/V communication
                 self._setup_varlen_ring_params(inputs)
+                # Collect buffers AFTER padding to get updated tensor references
+                buffers, seq_dims, _ = self._collect_buffers(inputs)
                 self._shard_buffers(buffers, seq_dims)
                 if use_ring_attn is not None:
                     use_ring_attn(True)
@@ -316,7 +347,8 @@ class ContextParallelManager:
                     self._varlen_cu_seqlens = None
                     _ACTIVE_MANAGER.reset(token)
             else:
-                # Dense mode: shard buffers as before
+                # Dense mode: shard buffers
+                buffers, seq_dims, _ = self._collect_buffers(inputs)
                 self._shard_buffers(buffers, seq_dims)
                 try:
                     yield
@@ -324,6 +356,7 @@ class ContextParallelManager:
                     _ACTIVE_MANAGER.reset(token)
         else:
             # Fall back to PyTorch's built-in context_parallel (SDPA-based)
+            buffers, seq_dims, no_restore = self._collect_buffers(inputs)
             with context_parallel(
                 self._mesh,
                 buffers = buffers,
