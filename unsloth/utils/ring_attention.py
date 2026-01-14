@@ -24,23 +24,32 @@ from typing import Callable, Optional
 class RingAttnVariant(Enum):
     """Ring attention variant selection."""
 
-    ZIGZAG = "zigzag"  # ~70% of single-GPU FA, best load balance
-    AUTO = "auto"  # Automatically select zigzag
+    ZIGZAG = "zigzag"  # ~70% of single-GPU FA, best load balance for dense
+    LLAMA3 = "llama3"  # ~57% of single-GPU FA, recommended for varlen
+    AUTO = "auto"  # zigzag for dense, llama3 for varlen
 
 
 # Try importing ring-flash-attention functions
 HAS_RING_FLASH_ATTN = False
 zigzag_ring_flash_attn_func = None
 zigzag_ring_flash_attn_varlen_func = None
+llama3_flash_attn_varlen_func = None
+llama3_flash_attn_prepare_cu_seqlens = None
 
 try:
     from ring_flash_attn import (
         zigzag_ring_flash_attn_func as _zigzag_dense,
         zigzag_ring_flash_attn_varlen_func as _zigzag_varlen,
+        llama3_flash_attn_varlen_func as _llama3_varlen,
+    )
+    from ring_flash_attn.llama3_flash_attn_varlen import (
+        llama3_flash_attn_prepare_cu_seqlens as _llama3_prepare,
     )
 
     zigzag_ring_flash_attn_func = _zigzag_dense
     zigzag_ring_flash_attn_varlen_func = _zigzag_varlen
+    llama3_flash_attn_varlen_func = _llama3_varlen
+    llama3_flash_attn_prepare_cu_seqlens = _llama3_prepare
     HAS_RING_FLASH_ATTN = True
 except ImportError:
     pass
@@ -67,10 +76,16 @@ def get_ring_attn_func(
     if not HAS_RING_FLASH_ATTN:
         return None
 
-    # Currently only zigzag is implemented
     if use_varlen:
-        return zigzag_ring_flash_attn_varlen_func
-    return zigzag_ring_flash_attn_func
+        # For varlen/packed sequences, use llama3 variant which handles
+        # cu_seqlens distribution automatically via llama3_flash_attn_prepare_cu_seqlens
+        if variant == RingAttnVariant.ZIGZAG:
+            return zigzag_ring_flash_attn_varlen_func
+        # AUTO and LLAMA3 both use llama3 for varlen
+        return llama3_flash_attn_varlen_func
+    else:
+        # For dense mode, use zigzag for best performance
+        return zigzag_ring_flash_attn_func
 
 
 def parse_ring_attn_variant(variant_str: str) -> RingAttnVariant:
@@ -89,4 +104,6 @@ __all__ = [
     "parse_ring_attn_variant",
     "zigzag_ring_flash_attn_func",
     "zigzag_ring_flash_attn_varlen_func",
+    "llama3_flash_attn_varlen_func",
+    "llama3_flash_attn_prepare_cu_seqlens",
 ]

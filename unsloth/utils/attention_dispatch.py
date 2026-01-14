@@ -33,6 +33,7 @@ from ..utils.ring_attention import (
     is_ring_flash_attn_available,
     get_ring_attn_func,
     RingAttnVariant,
+    llama3_flash_attn_prepare_cu_seqlens,
 )
 
 if HAS_FLASH_ATTENTION:
@@ -217,23 +218,41 @@ def run_attention(
         if context.seq_info is None:
             raise ValueError("RING_FLASH_VARLEN requires seq_info for packed sequences")
 
-        _, cu_seqlens, max_seqlen = context.seq_info
+        _, cu_seqlens_global, _ = context.seq_info
+        causal = flash_varlen_kwargs.get("causal", True)
+
+        # Use llama3_flash_attn_prepare_cu_seqlens to compute local cu_seqlens
+        # from global cu_seqlens for this rank
+        (
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            local_k_slice,
+        ) = llama3_flash_attn_prepare_cu_seqlens(
+            cu_seqlens_global,
+            causal = causal,
+            rank = cp_manager.cp_rank_index,
+            world_size = cp_manager.settings.size,
+        )
 
         # Ring-flash-attn varlen expects (total_tokens, H, D)
         Q_f = Q.transpose(1, 2).reshape(bsz * q_len, n_heads, head_dim)
         K_f = K.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
         V_f = V.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
 
-        # zigzag_ring_flash_attn_varlen_func only takes one cu_seqlens and one max_seqlen
-        # (unlike standard flash_attn_varlen_func which takes separate q/k versions)
         out = ring_attn_fn(
             Q_f,
             K_f,
             V_f,
-            cu_seqlens,
-            max_seqlen,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            heads_k_stride = 1,
+            local_k_slice = local_k_slice,
             dropout_p = flash_varlen_kwargs.get("dropout_p", 0.0),
-            causal = flash_varlen_kwargs.get("causal", True),
+            causal = causal,
             group = cp_manager.cp_group,
         )
         return out.view(bsz, q_len, n_heads, head_dim)
