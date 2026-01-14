@@ -197,10 +197,23 @@ def run_attention(
         cp_manager = get_cp_manager()
         ring_attn_fn = get_ring_attn_func(use_varlen = False)
 
-        # Ring-flash-attn expects (B, S, H, D) layout
-        Q_t = Q.transpose(1, 2)
-        K_t = K.transpose(1, 2)
-        V_t = V.transpose(1, 2)
+        # Ring-flash-attn expects (B, S, H, D) layout with contiguous tensors
+        Q_t = Q.transpose(1, 2).contiguous()
+        K_t = K.transpose(1, 2).contiguous()
+        V_t = V.transpose(1, 2).contiguous()
+
+        # Debug: Check for nan/inf in inputs
+        import os
+        if os.environ.get("UNSLOTH_DEBUG_RING_ATTN"):
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            q_has_nan = Q_t.isnan().any().item()
+            k_has_nan = K_t.isnan().any().item()
+            v_has_nan = V_t.isnan().any().item()
+            print(f"[Rank {rank}] RING_FLASH_DENSE input shapes: Q={Q_t.shape}, K={K_t.shape}, V={V_t.shape}")
+            print(f"[Rank {rank}] Input has nan: Q={q_has_nan}, K={k_has_nan}, V={v_has_nan}")
+            print(f"[Rank {rank}] Q range: [{Q_t.min().item():.4f}, {Q_t.max().item():.4f}]")
+            print(f"[Rank {rank}] cp_group={cp_manager.cp_group}, cp_rank={cp_manager.cp_rank_index}")
 
         out = ring_attn_fn(
             Q_t,
@@ -210,7 +223,16 @@ def run_attention(
             causal = flash_dense_kwargs.get("causal", True),
             group = cp_manager.cp_group,
         )
-        return out.view(bsz, q_len, n_heads, head_dim)
+
+        # Debug: Check for nan/inf in output
+        if os.environ.get("UNSLOTH_DEBUG_RING_ATTN"):
+            out_has_nan = out.isnan().any().item()
+            out_has_inf = out.isinf().any().item()
+            print(f"[Rank {rank}] RING_FLASH_DENSE output has nan={out_has_nan}, inf={out_has_inf}")
+            if not out_has_nan and not out_has_inf:
+                print(f"[Rank {rank}] Output range: [{out.min().item():.4f}, {out.max().item():.4f}]")
+
+        return out.reshape(bsz, q_len, n_heads, head_dim)
     elif backend == RING_FLASH_VARLEN:
         cp_manager = get_cp_manager()
         ring_attn_fn = get_ring_attn_func(use_varlen = True)
@@ -222,12 +244,21 @@ def run_attention(
         causal = flash_varlen_kwargs.get("causal", True)
         world_size = cp_manager.settings.size
 
-        # Ring-flash-attn varlen expects (total_tokens, H, D)
-        # cu_seqlens_global already includes padding (from get_packed_info_from_kwargs)
-        # so cu_seqlens_global[-1] == q_len (tensor length including padding)
-        Q_f = Q.transpose(1, 2).reshape(bsz * q_len, n_heads, head_dim)
-        K_f = K.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
-        V_f = V.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
+        # Verify global cu_seqlens is aligned for ring attention
+        global_total = int(cu_seqlens_global[-1].item())
+        if global_total % world_size != 0:
+            raise ValueError(
+                f"RING_FLASH_VARLEN requires global total_length ({global_total}) "
+                f"to be divisible by world_size ({world_size}). "
+                f"Ensure pad_to_multiple_of is set correctly."
+            )
+
+        # Ring-flash-attn varlen expects (total_tokens, H, D) with contiguous tensors
+        # Q/K/V are already sharded by CP manager, so bsz * q_len = local tokens
+        local_tokens = bsz * q_len
+        Q_f = Q.transpose(1, 2).reshape(local_tokens, n_heads, head_dim).contiguous()
+        K_f = K.transpose(1, 2).reshape(local_tokens, config.n_kv_heads, head_dim).contiguous()
+        V_f = V.transpose(1, 2).reshape(local_tokens, config.n_kv_heads, head_dim).contiguous()
 
         # Use llama3_flash_attn_prepare_cu_seqlens to compute local cu_seqlens
         # from global cu_seqlens for this rank
@@ -244,6 +275,31 @@ def run_attention(
             world_size = world_size,
         )
 
+        # Verify local cu_seqlens matches local tensor size
+        local_total_q = int(cu_seqlens_q[-1].item())
+        if local_total_q != local_tokens:
+            raise ValueError(
+                f"Shape mismatch: Q_f has {local_tokens} tokens but "
+                f"cu_seqlens_q expects {local_total_q}. "
+                f"cu_seqlens_global={cu_seqlens_global.tolist()}, "
+                f"cu_seqlens_q={cu_seqlens_q.tolist()}, "
+                f"rank={cp_manager.cp_rank_index}, world_size={world_size}"
+            )
+
+        # Debug: Check for nan/inf in inputs
+        import os
+        if os.environ.get("UNSLOTH_DEBUG_RING_ATTN"):
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            q_has_nan = Q_f.isnan().any().item()
+            k_has_nan = K_f.isnan().any().item()
+            v_has_nan = V_f.isnan().any().item()
+            print(f"[Rank {rank}] RING_FLASH_VARLEN input shapes: Q={Q_f.shape}, K={K_f.shape}, V={V_f.shape}")
+            print(f"[Rank {rank}] Input has nan: Q={q_has_nan}, K={k_has_nan}, V={v_has_nan}")
+            print(f"[Rank {rank}] cu_seqlens_q={cu_seqlens_q.tolist()}, cu_seqlens_k={cu_seqlens_k.tolist()}")
+            print(f"[Rank {rank}] max_seqlen_q={max_seqlen_q}, max_seqlen_k={max_seqlen_k}")
+            print(f"[Rank {rank}] local_k_slice={local_k_slice}")
+
         out = ring_attn_fn(
             Q_f,
             K_f,
@@ -258,6 +314,14 @@ def run_attention(
             causal = causal,
             group = cp_manager.cp_group,
         )
+
+        # Debug: Check for nan/inf in output
+        if os.environ.get("UNSLOTH_DEBUG_RING_ATTN"):
+            out_has_nan = out.isnan().any().item()
+            out_has_inf = out.isinf().any().item()
+            print(f"[Rank {rank}] RING_FLASH_VARLEN output has nan={out_has_nan}, inf={out_has_inf}")
+            if not out_has_nan and not out_has_inf:
+                print(f"[Rank {rank}] Output range: [{out.min().item():.4f}, {out.max().item():.4f}]")
 
         return out.view(bsz, q_len, n_heads, head_dim)
     elif backend == XFORMERS:

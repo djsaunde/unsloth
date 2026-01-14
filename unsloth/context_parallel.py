@@ -89,9 +89,10 @@ def _attach_context_parallel_attention_hooks(
     handles = []
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
-        # PyTorch's context_parallel needs attention_mask removed;
-        # ring-flash-attn keeps it for packed sequence boundary handling
-        if not use_ring_flash and "attention_mask" in module_kwargs:
+        # For context parallelism, attention_mask should be None to allow
+        # causal masking to be handled correctly by the attention kernel.
+        # Ring-flash-attn handles causality internally via the causal=True flag.
+        if "attention_mask" in module_kwargs:
             module_kwargs["attention_mask"] = None
         if "is_causal" in module_kwargs or hasattr(_module, "is_causal"):
             module_kwargs["is_causal"] = True
