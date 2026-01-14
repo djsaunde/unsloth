@@ -214,11 +214,14 @@ def get_packed_info_from_kwargs(
     Args:
         kwargs: Forward pass kwargs containing packed_seq_lengths.
         device: Device to place tensors on.
-        tensor_seq_len: Actual sequence length of the tensor (including padding).
-            If provided and greater than the sum of real sequence lengths,
-            cu_seqlens is extended to include the padded length. This is needed
-            for ring-flash-attention which requires total_length % world_size == 0.
+        tensor_seq_len: Local sequence length of the tensor (including padding).
+            For context parallelism, this is the sharded length; the function
+            computes the global length by multiplying by cp_size. If the global
+            length exceeds the sum of real sequence lengths, cu_seqlens is
+            extended to include the padded length. This is needed for
+            ring-flash-attention which requires total_length % world_size == 0.
     """
+    from ..context_parallel import get_cp_manager
 
     seq_lengths = kwargs.get("packed_seq_lengths")
     if seq_lengths is None:
@@ -232,12 +235,17 @@ def get_packed_info_from_kwargs(
     # If tensor has padding beyond real sequences, extend cu_seqlens to include it.
     # This ensures cu_seqlens[-1] equals the actual tensor length, which is required
     # for ring-flash-attention's llama3 variant (total_length % world_size == 0).
+    # Note: tensor_seq_len is the local (sharded) length; multiply by cp_size for global.
     real_total = int(cu_seqlens[-1].item())
-    if tensor_seq_len is not None and tensor_seq_len > real_total:
-        cu_seqlens = torch.cat([
-            cu_seqlens,
-            torch.tensor([tensor_seq_len], dtype = torch.int32, device = device)
-        ])
+    if tensor_seq_len is not None:
+        cp_manager = get_cp_manager()
+        cp_size = cp_manager.settings.size if cp_manager else 1
+        global_tensor_len = tensor_seq_len * cp_size
+        if global_tensor_len > real_total:
+            cu_seqlens = torch.cat([
+                cu_seqlens,
+                torch.tensor([global_tensor_len], dtype = torch.int32, device = device)
+            ])
 
     max_seqlen = int(lengths.max().item())
     return lengths, cu_seqlens, max_seqlen
