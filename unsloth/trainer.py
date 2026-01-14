@@ -323,6 +323,23 @@ def _patch_sft_trainer_auto_packing(trl_module):
 
         cp_blocks_packing = is_context_parallel and not is_ring_flash_attn_available()
 
+        # Validate pad_to_multiple_of alignment for CP + packing with ring-flash-attn
+        # The llama3 ring attention variant requires total_length % world_size == 0
+        if is_context_parallel and is_ring_flash_attn_available():
+            pad_multiple = getattr(config_arg, "pad_to_multiple_of", None)
+            if pad_multiple is None or pad_multiple % cp_size != 0:
+                # Auto-correct to ensure alignment
+                new_pad_multiple = cp_size if pad_multiple is None else (
+                    ((pad_multiple + cp_size - 1) // cp_size) * cp_size
+                )
+                setattr(config_arg, "pad_to_multiple_of", new_pad_multiple)
+                if pad_multiple is not None:
+                    print(
+                        f"Unsloth: Adjusted pad_to_multiple_of from {pad_multiple} to "
+                        f"{new_pad_multiple} for context parallelism alignment "
+                        f"(must be divisible by context_parallel_size={cp_size})."
+                    )
+
         # Block packing/padding-free for incompatible configurations
         blocked = (
             (data_collator is not None)

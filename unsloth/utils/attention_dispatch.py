@@ -220,6 +220,14 @@ def run_attention(
 
         _, cu_seqlens_global, _ = context.seq_info
         causal = flash_varlen_kwargs.get("causal", True)
+        world_size = cp_manager.settings.size
+
+        # Ring-flash-attn varlen expects (total_tokens, H, D)
+        # cu_seqlens_global already includes padding (from get_packed_info_from_kwargs)
+        # so cu_seqlens_global[-1] == q_len (tensor length including padding)
+        Q_f = Q.transpose(1, 2).reshape(bsz * q_len, n_heads, head_dim)
+        K_f = K.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
+        V_f = V.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
 
         # Use llama3_flash_attn_prepare_cu_seqlens to compute local cu_seqlens
         # from global cu_seqlens for this rank
@@ -233,13 +241,8 @@ def run_attention(
             cu_seqlens_global,
             causal = causal,
             rank = cp_manager.cp_rank_index,
-            world_size = cp_manager.settings.size,
+            world_size = world_size,
         )
-
-        # Ring-flash-attn varlen expects (total_tokens, H, D)
-        Q_f = Q.transpose(1, 2).reshape(bsz * q_len, n_heads, head_dim)
-        K_f = K.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
-        V_f = V.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
 
         out = ring_attn_fn(
             Q_f,
@@ -255,6 +258,7 @@ def run_attention(
             causal = causal,
             group = cp_manager.cp_group,
         )
+
         return out.view(bsz, q_len, n_heads, head_dim)
     elif backend == XFORMERS:
         attn_bias = build_xformers_block_causal_mask(
