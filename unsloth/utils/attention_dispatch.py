@@ -224,13 +224,13 @@ def run_attention(
         K_f = K.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
         V_f = V.transpose(1, 2).reshape(bsz * q_len, config.n_kv_heads, head_dim)
 
+        # zigzag_ring_flash_attn_varlen_func only takes one cu_seqlens and one max_seqlen
+        # (unlike standard flash_attn_varlen_func which takes separate q/k versions)
         out = ring_attn_fn(
             Q_f,
             K_f,
             V_f,
             cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
             max_seqlen,
             dropout_p = flash_varlen_kwargs.get("dropout_p", 0.0),
             causal = flash_varlen_kwargs.get("causal", True),
