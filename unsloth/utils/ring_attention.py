@@ -36,6 +36,11 @@ zigzag_ring_flash_attn_varlen_func = None
 llama3_flash_attn_varlen_func = None
 llama3_flash_attn_prepare_cu_seqlens = None
 
+# HF adapter functions for patching transformers' flash attention
+substitute_hf_flash_attn = None
+update_ring_flash_attn_params = None
+use_ring_attn = None
+
 try:
     from ring_flash_attn import (
         zigzag_ring_flash_attn_func as _zigzag_dense,
@@ -45,11 +50,19 @@ try:
     from ring_flash_attn.llama3_flash_attn_varlen import (
         llama3_flash_attn_prepare_cu_seqlens as _llama3_prepare,
     )
+    from ring_flash_attn.adapters.hf_adapter import (
+        substitute_hf_flash_attn as _substitute_hf,
+        update_ring_flash_attn_params as _update_params,
+        use_ring_attn as _use_ring,
+    )
 
     zigzag_ring_flash_attn_func = _zigzag_dense
     zigzag_ring_flash_attn_varlen_func = _zigzag_varlen
     llama3_flash_attn_varlen_func = _llama3_varlen
     llama3_flash_attn_prepare_cu_seqlens = _llama3_prepare
+    substitute_hf_flash_attn = _substitute_hf
+    update_ring_flash_attn_params = _update_params
+    use_ring_attn = _use_ring
     HAS_RING_FLASH_ATTN = True
 except ImportError:
     pass
@@ -106,4 +119,7 @@ __all__ = [
     "zigzag_ring_flash_attn_varlen_func",
     "llama3_flash_attn_varlen_func",
     "llama3_flash_attn_prepare_cu_seqlens",
+    "substitute_hf_flash_attn",
+    "update_ring_flash_attn_params",
+    "use_ring_attn",
 ]
